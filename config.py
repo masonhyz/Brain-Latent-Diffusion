@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     data_root: str = "fmri"  # folder containing pre_surgery and 6_months_post_surgery
-    out_dir: str = "./runs/new_run"
+    out_dir: str = "./runs/unet_post_filter"
     seed: int = 42
 
     # training
@@ -15,5 +15,5 @@ class Config:
     val_frac: float = 0.15
 
     # model
-    base_channels: int = 128  # increase to 48/64 if you want more capacity
+    base_channels: int = 64  # increase to 48/64 if you want more capacity
     amp: bool = True
