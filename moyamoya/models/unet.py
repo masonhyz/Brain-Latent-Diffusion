@@ -1,64 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-
-# -------------------------
-# 3D UNet (small, solid baseline)
-# -------------------------
-class DoubleConv3d(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm3d(out_ch),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm3d(out_ch),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-def _match_size(src: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """
-    Center-crop (or pad) src so that src spatial dims match ref spatial dims.
-    src/ref shape: [B, C, D, H, W]
-    """
-    sd, sh, sw = src.shape[-3:]
-    rd, rh, rw = ref.shape[-3:]
-
-    # If src is larger: crop
-    dd = sd - rd
-    dh = sh - rh
-    dw = sw - rw
-
-    d0 = max(dd // 2, 0)
-    h0 = max(dh // 2, 0)
-    w0 = max(dw // 2, 0)
-
-    d1 = d0 + min(rd, sd)
-    h1 = h0 + min(rh, sh)
-    w1 = w0 + min(rw, sw)
-
-    src = src[..., d0:d1, h0:h1, w0:w1]
-
-    # If src is smaller: pad
-    sd, sh, sw = src.shape[-3:]
-    pd = rd - sd
-    ph = rh - sh
-    pw = rw - sw
-    if pd > 0 or ph > 0 or pw > 0:
-        pad = (
-            max(pw // 2, 0), max(pw - pw // 2, 0),
-            max(ph // 2, 0), max(ph - ph // 2, 0),
-            max(pd // 2, 0), max(pd - pd // 2, 0),
-        )
-        src = F.pad(src, pad)
-
-    return src
+from moyamoya.modules import DoubleConv3d, _match_size
 
 
 class UNet3D(nn.Module):

@@ -1,42 +1,59 @@
 import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from typing import Optional
 import torch
 from torch.utils.data import DataLoader, random_split
-from unet import UNet3D
-from dataset import PrePostFMRI
-from config import Config
-from transform import ToChannelsFirstAndNormalize
-from utils import seed_everything, make_union_mask, masked_l1
+from moyamoya.utils import seed_everything, make_union_mask, masked_l1
+from moyamoya.dataset import PrePostFMRI
+from moyamoya.config import Config
+from moyamoya.transform import ToChannelsFirstAndNormalize
+from moyamoya.models.cvae import CVAE3D
 import json
 
 
 @torch.no_grad()
-def validate(model, loader, device, amp: bool):
+def validate_cvae(model, val_loader, device, amp: bool, beta_kl: float):
     model.eval()
-    total = 0.0
-    total_id = 0.0
+    running = 0.0
+    running_id = 0.0
+    running_recon = 0.0
+    running_kl = 0.0
     n = 0
 
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)  # [B,C,D,H,W]
+    for x, y in val_loader:
+        x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-
         mask = make_union_mask(x, y)
 
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
-            pred_delta = model(x)     # model predicts delta
-            pred = x + pred_delta     # reconstruct predicted post
-            loss = masked_l1(pred, y, mask)
+            pred = model(x)
+            recon_loss = masked_l1(pred, y, mask)
 
-            # identity baseline: pred = x
+            mu = getattr(model, "last_mu", None)
+            logvar = getattr(model, "last_logvar", None)
+            if mu is None or logvar is None:
+                raise RuntimeError("CVAE must set model.last_mu and model.last_logvar in forward().")
+
+            kl = model.kl_divergence(mu, logvar)
+            loss = recon_loss + beta_kl * kl
+
             id_loss = masked_l1(x, y, mask)
 
-        total += float(loss) * x.size(0)
-        total_id += float(id_loss) * x.size(0)
-        n += x.size(0)
+        bs = x.size(0)
+        running += float(loss) * bs
+        running_recon += float(recon_loss) * bs
+        running_kl += float(kl) * bs
+        running_id += float(id_loss) * bs
+        n += bs
 
-    return total / max(n, 1), total_id / max(n, 1)
-
+    return (
+        running / max(n, 1),
+        running_id / max(n, 1),
+        running_recon / max(n, 1),
+        running_kl / max(n, 1),
+    )
 
 
 def train(
@@ -49,6 +66,7 @@ def train(
     out_dir: str,
     amp: bool = True,
     grad_clip: Optional[float] = 1.0,
+    beta_kl: float = 1e-4,   # <- tune this (start small)
 ):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
@@ -59,6 +77,8 @@ def train(
         model.train()
         running = 0.0
         running_id = 0.0
+        running_recon = 0.0
+        running_kl = 0.0
         n = 0
 
         for x, y in train_loader:
@@ -70,11 +90,23 @@ def train(
             optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=amp):
-                pred_delta = model(x)
-                pred = x + pred_delta
-                loss = masked_l1(pred, y, mask)
+                # ---- CVAE predicts y directly ----
+                pred = model(x)  # [B,out_ch,D,H,W]
 
-                # identity baseline loss for monitoring (no grad needed but cheap)
+                # masked reconstruction loss
+                recon_loss = masked_l1(pred, y, mask)
+
+                # KL term (expects CVAE has last_mu/last_logvar OR exposes kl_divergence)
+                mu = getattr(model, "last_mu", None)
+                logvar = getattr(model, "last_logvar", None)
+                if mu is None or logvar is None:
+                    raise RuntimeError("CVAE must set model.last_mu and model.last_logvar in forward().")
+
+                kl = model.kl_divergence(mu, logvar)
+
+                loss = recon_loss + beta_kl * kl
+
+                # identity baseline for monitoring
                 id_loss = masked_l1(x, y, mask)
 
             scaler.scale(loss).backward()
@@ -86,19 +118,24 @@ def train(
             scaler.step(optimizer)
             scaler.update()
 
-            running += float(loss) * x.size(0)
-            running_id += float(id_loss) * x.size(0)
-            n += x.size(0)
+            bs = x.size(0)
+            running += float(loss) * bs
+            running_recon += float(recon_loss) * bs
+            running_kl += float(kl) * bs
+            running_id += float(id_loss) * bs
+            n += bs
 
         train_loss = running / max(n, 1)
+        train_recon = running_recon / max(n, 1)
+        train_kl = running_kl / max(n, 1)
         train_id = running_id / max(n, 1)
 
-        val_loss, val_id = validate(model, val_loader, device, amp)
+        val_loss, val_id, val_recon, val_kl = validate_cvae(model, val_loader, device, amp, beta_kl)
 
         print(
             f"Epoch {epoch:03d} | "
-            f"train maskedL1: {train_loss:.5f} (id={train_id:.5f}) | "
-            f"val maskedL1: {val_loss:.5f} (id={val_id:.5f})"
+            f"train total: {train_loss:.5f} (recon={train_recon:.5f}, kl={train_kl:.5f}, id={train_id:.5f}) | "
+            f"val total: {val_loss:.5f} (recon={val_recon:.5f}, kl={val_kl:.5f}, id={val_id:.5f})"
         )
 
         torch.save(
@@ -170,7 +207,7 @@ def main():
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
-    model = UNet3D(in_channels=in_ch, out_channels=out_ch, base=cfg.base_channels).to(device)
+    model = CVAE3D(in_channels=in_ch, out_channels=out_ch, base=cfg.base_channels).to(device)
     print("Params:", sum(p.numel() for p in model.parameters()) / 1e6, "M")
 
     train(

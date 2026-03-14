@@ -20,15 +20,17 @@ Usage:
 """
 
 import argparse
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from typing import Dict
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from dataset import PrePostFMRI
-from train import ToChannelsFirstAndNormalize  # adjust import
+from moyamoya.dataset import PrePostFMRI
+from moyamoya.transform import ToChannelsFirstAndNormalize
 
 
 def get_orthogonal_slices(vol_chdhw: np.ndarray) -> Dict[str, np.ndarray]:
