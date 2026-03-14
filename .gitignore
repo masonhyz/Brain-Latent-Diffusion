@@ -1,0 +1,25 @@
+# Third-party repositories (clone separately — see README)
+third_party/
+
+# Data
+fmri/
+
+# Training artifacts
+checkpoints/
+checkpoints_minimal/
+runs/
+outputs/
+qc/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Misc
+.DS_Store
+*.swp

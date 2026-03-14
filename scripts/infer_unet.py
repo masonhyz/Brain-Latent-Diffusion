@@ -9,7 +9,7 @@ Inference on a single (pre, post) pair from your PrePostFMRI dataset:
 - plots a chosen slice comparing: pre, post GT, pred
 
 Usage:
-  python infer_one.py \
+  python infer_unet.py \
     --data_root /path/to/fmri \
     --ckpt /path/to/best.pt \
     --base_channels 128 \
@@ -25,15 +25,17 @@ Notes:
 """
 
 import argparse
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from dataset import PrePostFMRI
-from unet import UNet3D
-from transform import ToChannelsFirstAndNormalize
+from moyamoya.dataset import PrePostFMRI
+from moyamoya.models.unet import UNet3D
+from moyamoya.transform import ToChannelsFirstAndNormalize
 
 
 def l1_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
