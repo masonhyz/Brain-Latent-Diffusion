@@ -1,4 +1,4 @@
-# Moyamoya fMRI Pre/Post Surgery Translation
+# Moyamoya Post Surgery Whole Brain fMRI Forecast with Latent Diffusion
 
 Models for predicting post-surgery CBF (cerebral blood flow) from pre-surgery fMRI using paired and unpaired image-to-image translation.
 
