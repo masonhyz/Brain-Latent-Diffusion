@@ -23,3 +23,10 @@ build/
 # Misc
 .DS_Store
 *.swp
+
+# Local tooling / agent state
+.claude/
+
+# Scratch artifacts at repo root (figures, logs)
+/*.png
+/*.log

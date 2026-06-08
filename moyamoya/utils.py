@@ -1,6 +1,15 @@
+import os
 import random
 import numpy as np
 import torch
+
+
+def get_device() -> torch.device:
+    """Return the active CUDA device, controlled by the GPU env var (default: 1)."""
+    if torch.cuda.is_available():
+        gpu = int(os.environ.get("GPU", 1))
+        return torch.device(f"cuda:{gpu}")
+    return torch.device("cpu")
 
 
 def seed_everything(seed: int = 42):
