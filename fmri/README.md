@@ -42,7 +42,7 @@ fmri/
 ## Populating the folder
 
 The canonical scans are reconstructed elsewhere and copied in by
-`scripts/setup_data.py`, which pulls the matching pre/post CBF map for each
+`fmri/setup_data.py`, which pulls the matching pre/post CBF map for each
 subject that has **both** available and writes them here with the
 `<year>_<id>.nii.gz` naming above. A subject is skipped until both its pre and
 post maps exist. If you are adding data by hand, follow the same rules.

@@ -105,7 +105,7 @@ Place data in `fmri/` as shown [above](#data), or copy from the raw source
 (edit the paths in the script first):
 
 ```bash
-python scripts/setup_data.py
+python fmri/setup_data.py
 ```
 
 ## Training
