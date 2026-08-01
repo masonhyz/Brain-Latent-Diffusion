@@ -18,6 +18,7 @@ import argparse
 import csv
 import json
 import random
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,50 @@ from moyamoya.utils import seed_everything, get_device
 from moyamoya.metrics import compute_metrics
 from moyamoya.models.ldm_7tcdm3d import build_paired_latent_diffusion_7tcdm
 from moyamoya.models.ldm3d import build_autoencoder
+
+
+# ── run logging: mirror the console to a per-run logfile ─────────────────────
+
+class _Tee:
+    """Duplicate stream writes to the real console and a logfile."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
+def install_run_logger(out_dir: Path, stage: int) -> Path:
+    """Tee stdout/stderr into out_dir/train_stage{stage}.log (append mode).
+
+    Runs are appended (not truncated) so re-running a stage into the same
+    out_dir preserves earlier console history, each delimited by a banner.
+    """
+    log_path = out_dir / f"train_stage{stage}.log"
+    logfile = open(log_path, "a", buffering=1)  # line-buffered
+    logfile.write(f"\n===== stage {stage} run started {datetime.now().isoformat()} =====\n")
+    sys.stdout = _Tee(sys.__stdout__, logfile)
+    sys.stderr = _Tee(sys.__stderr__, logfile)
+    return log_path
+
+
+def _git_commit():
+    """Short git SHA of the working tree, or None if unavailable."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return None
 
 
 # ── visualisation helpers (matching eval_ldm_7tcdm3d.py) ─────────────────────
@@ -214,6 +259,7 @@ def save_hparams(args, n_train: int, n_val: int, out_dir: Path) -> None:
         "model": "ldm_7tcdm3d",
         "stage": args.stage,
         "timestamp": datetime.now().isoformat(),
+        "git_commit": _git_commit(),
         "args": vars(args),
         "dataset": {
             "data_root": args.data_root,
@@ -300,6 +346,7 @@ def make_loaders(args):
 def train_stage1(args, device):
     out_dir = Path(args.out_dir or "runs/ldm_7tcdm3d")
     out_dir.mkdir(parents=True, exist_ok=True)
+    install_run_logger(out_dir, stage=1)
 
     train_dl, val_dl = make_loaders(args)
     save_hparams(args, len(train_dl.dataset), len(val_dl.dataset), out_dir)
@@ -376,6 +423,7 @@ def train_stage2(args, device):
 
     out_dir = Path(args.out_dir or "runs/ldm_7tcdm3d")
     out_dir.mkdir(parents=True, exist_ok=True)
+    install_run_logger(out_dir, stage=2)
     vis_dir = out_dir / "vis_stage2"
     vis_dir.mkdir(exist_ok=True)
 

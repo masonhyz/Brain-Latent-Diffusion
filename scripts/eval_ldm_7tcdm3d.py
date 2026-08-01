@@ -7,14 +7,16 @@ in the PrePostFMRI dataset.  For each sample produces a 3×3 grid:
     rows : Axial | Coronal | Sagittal
     cols : Pre-surgery | Post-surgery GT | Prediction
 
-Also writes outputs/eval_ldm_7tcdm3d/metrics.csv with per-sample metrics
-(MAE, MSE, PSNR, SSIM) and prints a summary.
+Output layout (default --out_dir outputs/eval/ldm_7tcdm3d):
+    grids/<id>.png   per-sample 3×3 grids
+    metrics.csv      per-sample MAE / MSE / PSNR / SSIM
+    summary.json     run config + aggregate stats (mean/std/median/min/max)
 
 Usage:
     python scripts/eval_ldm_7tcdm3d.py \\
         --data_root fmri \\
         --ckpt runs/ldm_7tcdm3d/stage2_best.pt \\
-        --out_dir outputs/eval_ldm_7tcdm3d
+        --out_dir outputs/eval/ldm_7tcdm3d
 
 All architecture / diffusion hyper-parameters are read from the checkpoint's
 embedded 'args' dict, so you rarely need to override them.
@@ -22,7 +24,9 @@ embedded 'args' dict, so you rarely need to override them.
 
 import argparse
 import csv
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -109,7 +113,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data_root",      type=str,   default="fmri")
     p.add_argument("--ckpt",           type=str,   default="runs/ldm_7tcdm3d/stage2_best.pt")
-    p.add_argument("--out_dir",        type=str,   default="outputs/eval_ldm_7tcdm3d")
+    p.add_argument("--out_dir",        type=str,   default="outputs/eval/ldm_7tcdm3d")
     p.add_argument("--pre_dirname",    type=str,   default="pre_surgery")
     p.add_argument("--post_dirname",   type=str,   default="6_months_post_surgery")
     p.add_argument("--ddim_steps",     type=int,   default=None)
@@ -127,7 +131,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp    = bool(args.amp and device.type == "cuda")
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    grids_dir = out_dir / "grids"
+    grids_dir.mkdir(parents=True, exist_ok=True)
 
     raw = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     ckpt_args = raw["args"]
@@ -202,7 +207,7 @@ def main():
 
         m = compute_metrics(pred_cpu, y_cpu, mask)
 
-        grid_path = out_dir / f"{sid}.png"
+        grid_path = grids_dir / f"{sid}.png"
         save_grid(_to_np(x_cpu), _to_np(y_cpu), _to_np(pred_cpu), sid, m, grid_path)
 
         rows.append({"id": sid, **m})
@@ -216,12 +221,41 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
+    def _stats(vals):
+        a = np.asarray(vals, dtype=float)
+        return {
+            "mean":   float(a.mean()),
+            "std":    float(a.std()),
+            "median": float(np.median(a)),
+            "min":    float(a.min()),
+            "max":    float(a.max()),
+        }
+
     print(f"\n{'='*60}")
     print(f"Samples: {len(rows)}")
     for col, label in [("mae", "MAE"), ("mse", "MSE"), ("psnr", "PSNR (dB)"), ("ssim", "SSIM")]:
         vals = [r[col] for r in rows]
         print(f"  {label:10s}  mean={np.mean(vals):.5f}  std={np.std(vals):.5f}  median={np.median(vals):.5f}")
     print(f"Metrics saved: {csv_path}")
+
+    # aggregate summary — the durable, structured record of this eval run
+    summary = {
+        "model":          "ldm_7tcdm3d",
+        "timestamp":      datetime.now().isoformat(),
+        "ckpt":           args.ckpt,
+        "data_root":      args.data_root,
+        "ddim_steps":     ddim_steps,
+        "guidance_scale": guidance_scale,
+        "eta":            args.eta,
+        "val_only":       args.val_only,
+        "n_samples":      len(rows),
+        "metrics":        {col: _stats([r[col] for r in rows])
+                           for col in ["mae", "mse", "psnr", "ssim"]},
+    }
+    summary_path = out_dir / "summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Summary saved: {summary_path}")
 
 
 if __name__ == "__main__":

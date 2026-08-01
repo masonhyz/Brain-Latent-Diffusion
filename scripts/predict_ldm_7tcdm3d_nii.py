@@ -18,11 +18,13 @@ normalised intensities), at the original voxel grid.
 Usage:
     CUDA_VISIBLE_DEVICES=0 python scripts/predict_ldm_7tcdm3d_nii.py \
         --ckpt runs/cfg3_rich_latent/stage2_best.pt --subject 2024_040 \
-        --out_dir outputs/predict_cfg3_2024_040
+        --out_dir outputs/predict/2024_040     # default: outputs/predict/<subject>
 """
 
 import argparse
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -51,7 +53,7 @@ def main():
                    help="Average this many independent DDIM draws (ensemble mean; >1 reduces sampling noise)")
     args = p.parse_args()
 
-    out_dir = Path(args.out_dir or f"outputs/predict_{args.subject}")
+    out_dir = Path(args.out_dir or f"outputs/predict/{args.subject}")
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -113,6 +115,22 @@ def main():
     nib.save(nib.Nifti1Image(pred_xyz, affine=pre_img.affine, header=hdr), out_nii)
     print(f"Saved volume : {out_nii}  shape={pred_xyz.shape}  (z-score normalised units)")
     print(f"Saved grid   : {png}")
+
+    meta_path = out_dir / "metrics.json"
+    with open(meta_path, "w") as f:
+        json.dump({
+            "model":          "ldm_7tcdm3d",
+            "timestamp":      datetime.now().isoformat(),
+            "subject":        args.subject,
+            "ckpt":           args.ckpt,
+            "ddim_steps":     ddim_steps,
+            "guidance_scale": gs,
+            "eta":            args.eta,
+            "seed":           args.seed,
+            "n_samples":      args.n_samples,
+            "metrics":        {k: float(m[k]) for k in ("mae", "mse", "psnr", "ssim")},
+        }, f, indent=2)
+    print(f"Saved metrics: {meta_path}")
 
 
 if __name__ == "__main__":
