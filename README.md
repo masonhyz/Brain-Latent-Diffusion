@@ -260,5 +260,5 @@ python scripts/infer_cyclegan_3d.py --name fmri_3d_cyclegan
 ### Quality control
 
 ```bash
-python scripts/qc.py --data_root fmri/ --out_dir qc/    # orthogonal-slice pre-vs-post grids
+python fmri/qc.py    # orthogonal-slice pre-vs-post grids -> fmri/qc/ (see fmri/README.md)
 ```
