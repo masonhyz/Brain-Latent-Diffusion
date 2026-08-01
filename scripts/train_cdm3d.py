@@ -22,30 +22,17 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from skimage.metrics import structural_similarity
-from torch.utils.data import DataLoader, random_split
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from moyamoya.dataset import PrePostFMRI
-from moyamoya.transform import (
-    ToChannelsFirstAndNormalize,
-    PairedRandomFlip,
-    PairedRandomIntensityScale,
-    PairedCompose,
-)
+from moyamoya.data import build_loaders
 from moyamoya.utils import seed_everything, get_device
+from moyamoya.metrics import compute_metrics as _compute_metrics
+from moyamoya.viz import percentile_norm as _to_np
 from moyamoya.models.cdm3d import build_cdm3d, EMA
 
 
 # ── visualisation ─────────────────────────────────────────────────────────────
-
-def _to_np(vol: torch.Tensor) -> np.ndarray:
-    v = vol.squeeze().cpu().float().numpy()
-    mask = v != 0
-    lo, hi = (np.percentile(v[mask], [1, 99]) if mask.any() else (v.min(), v.max()))
-    return np.clip((v - lo) / (hi - lo + 1e-8), 0, 1)
-
 
 def _get_slices(vol_np: np.ndarray) -> dict:
     D, H, W = vol_np.shape
@@ -92,19 +79,8 @@ def save_grid(
 # ── metrics ───────────────────────────────────────────────────────────────────
 
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> dict:
-    p = np.nan_to_num(pred.squeeze().cpu().float().numpy(), nan=0.0, posinf=0.0, neginf=0.0)
-    t = target.squeeze().cpu().float().numpy()
-    m = mask.squeeze().cpu().bool().numpy()
-
-    mp, mt = p[m], t[m]
-    mae = float(np.abs(mp - mt).mean())
-    mse = float(((mp - mt) ** 2).mean())
-    data_range = float(mt.max() - mt.min()) if mt.max() > mt.min() else 1.0
-    psnr = float(10 * np.log10(data_range ** 2 / (mse + 1e-12)))
-    ssim_val = float(structural_similarity(
-        t, p, data_range=data_range, win_size=7, channel_axis=None,
-    ))
-    return {"mae": mae, "mse": mse, "psnr": psnr, "ssim": ssim_val}
+    # Sampled predictions during training can be unstable → sanitise NaN/Inf.
+    return _compute_metrics(pred, target, mask, sanitize_pred=True)
 
 
 # ── training progression plot ─────────────────────────────────────────────────
@@ -222,39 +198,8 @@ def get_args():
 
 # ── data ─────────────────────────────────────────────────────────────────────
 
-class _AugmentedSubset(torch.utils.data.Dataset):
-    def __init__(self, subset, aug):
-        self.subset = subset
-        self.aug    = aug
-
-    def __len__(self):
-        return len(self.subset)
-
-    def __getitem__(self, idx):
-        x, y = self.subset[idx]
-        return self.aug(x, y)
-
-
 def make_loaders(args):
-    base_tfm = ToChannelsFirstAndNormalize(nonzero_mask=True)
-    ds = PrePostFMRI(root_dir=args.data_root, transform=base_tfm, strict=False)
-
-    n_val   = max(1, int(len(ds) * args.val_frac))
-    n_train = len(ds) - n_val
-    g = torch.Generator().manual_seed(args.seed)
-    train_subset, val_subset = random_split(ds, [n_train, n_val], generator=g)
-
-    aug = PairedCompose([
-        PairedRandomFlip(p=0.5),
-        PairedRandomIntensityScale(scale_range=(0.9, 1.1)),
-    ])
-    train_ds = _AugmentedSubset(train_subset, aug)
-
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.num_workers, pin_memory=True)
-    val_dl   = DataLoader(val_subset, batch_size=1, shuffle=False,
-                          num_workers=args.num_workers, pin_memory=True)
-    return train_dl, val_dl
+    return build_loaders(args, augment=True)
 
 
 # ── checkpoint helpers ────────────────────────────────────────────────────────

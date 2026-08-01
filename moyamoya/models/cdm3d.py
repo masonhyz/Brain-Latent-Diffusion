@@ -50,18 +50,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from ..modules import (
+    group_norm_groups as _ng,
+    Block3D,
+    ResnetBlock3D,
+    Downsample3D,
+    Upsample3D,
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _ng(ch: int, max_g: int = 8) -> int:
-    """Largest divisor of ch that is ≤ max_g (safe GroupNorm groups)."""
-    for g in range(min(ch, max_g), 0, -1):
-        if ch % g == 0:
-            return g
-    return 1
-
 
 def _match_size(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """Trim or pad x to match ref's spatial dims (handles stride-2 off-by-one)."""
@@ -146,43 +146,6 @@ class SinusoidalPosEmb(nn.Module):
         return torch.cat([emb.sin(), emb.cos()], dim=-1)
 
 
-class Block3D(nn.Module):
-    """Standard 3×3×3 conv + GroupNorm + SiLU with optional scale-shift conditioning."""
-    def __init__(self, dim: int, dim_out: int, groups: int = 8):
-        super().__init__()
-        self.proj = nn.Conv3d(dim, dim_out, 3, padding=1)
-        self.norm = nn.GroupNorm(_ng(dim_out, groups), dim_out)
-        self.act  = nn.SiLU()
-
-    def forward(self, x: torch.Tensor, scale_shift=None) -> torch.Tensor:
-        x = self.norm(self.proj(x))
-        if scale_shift is not None:
-            scale, shift = scale_shift
-            x = x * (scale + 1) + shift
-        return self.act(x)
-
-
-class ResnetBlock3D(nn.Module):
-    """Standard 3-D ResBlock with scale-shift time conditioning."""
-    def __init__(self, dim: int, dim_out: int, *, time_emb_dim: int = None, groups: int = 8):
-        super().__init__()
-        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out * 2)) \
-            if time_emb_dim is not None else None
-        self.block1   = Block3D(dim,     dim_out, groups)
-        self.block2   = Block3D(dim_out, dim_out, groups)
-        self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor = None) -> torch.Tensor:
-        scale_shift = None
-        if self.mlp is not None and t_emb is not None:
-            # Pitfall #2: must rearrange to 'b c 1 1 1' for 5-D (was 'b c 1 1' in 2D).
-            ss = rearrange(self.mlp(t_emb), 'b c -> b c 1 1 1')
-            scale_shift = ss.chunk(2, dim=1)
-        h = self.block1(x, scale_shift)
-        h = self.block2(h)
-        return h + self.res_conv(x)
-
-
 class BlockDW3D(nn.Module):
     """Depthwise-separable 3-D conv block (ported from Block2d in 7TCDM)."""
     def __init__(self, dim: int, dim_out: int, groups: int = 8):
@@ -221,15 +184,6 @@ class ResnetBlockDW3D(nn.Module):
         h = self.block1(x, scale_shift)
         h = self.block2(h)
         return h + self.res_conv(x)
-
-
-# Pitfall #1: stride-2 3-D down/upsample — was Conv2d/ConvTranspose2d in original.
-def Downsample3D(dim: int) -> nn.Module:
-    return nn.Conv3d(dim, dim, kernel_size=4, stride=2, padding=1)
-
-
-def Upsample3D(dim: int) -> nn.Module:
-    return nn.ConvTranspose3d(dim, dim, kernel_size=4, stride=2, padding=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -458,6 +412,7 @@ class GaussianDiffusion3D(nn.Module):
             t_seq = torch.linspace(1.0, 0.0, self.ddim_steps + 1, device=device)
 
             x = torch.randn(B, 1, D, H, W, device=device)
+            zero_cond = torch.zeros_like(x_pre)  # loop-invariant CFG conditioning
 
             for i in range(self.ddim_steps):
                 t_cur  = t_seq[i].expand(B)
@@ -468,7 +423,7 @@ class GaussianDiffusion3D(nn.Module):
 
                 if guidance_scale != 1.0:
                     x0_unc  = self.denoise_fn(
-                        torch.cat([torch.zeros_like(x_pre), x], dim=1), t_cur * self.T
+                        torch.cat([zero_cond, x], dim=1), t_cur * self.T
                     ).float()
                     x0_pred = x0_unc + guidance_scale * (x0_pred - x0_unc)
 

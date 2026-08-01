@@ -20,32 +20,17 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from skimage.metrics import structural_similarity
-from torch.utils.data import random_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from moyamoya.dataset import PrePostFMRI
 from moyamoya.transform import ToChannelsFirstAndNormalize
+from moyamoya.data import reconstruct_val_split
 from moyamoya.utils import seed_everything, get_device
+from moyamoya.metrics import compute_metrics
 from moyamoya.models.cdm3d import build_cdm3d
 
 
-def compute_metrics(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> dict:
-    """Identical to scripts/train_cdm3d.py compute_metrics."""
-    p = pred.squeeze().cpu().float().numpy()
-    t = target.squeeze().cpu().float().numpy()
-    m = mask.squeeze().cpu().bool().numpy()
-
-    mp, mt = p[m], t[m]
-    mae = float(np.abs(mp - mt).mean())
-    mse = float(((mp - mt) ** 2).mean())
-    data_range = float(mt.max() - mt.min()) if mt.max() > mt.min() else 1.0
-    psnr = float(10 * np.log10(data_range ** 2 / (mse + 1e-12)))
-    ssim_val = float(structural_similarity(
-        t, p, data_range=data_range, win_size=7, channel_axis=None,
-    ))
-    return {"mae": mae, "mse": mse, "psnr": psnr, "ssim": ssim_val}
 
 
 def get_args():
@@ -120,13 +105,10 @@ def main():
     base_tfm = ToChannelsFirstAndNormalize(nonzero_mask=True)
     ds = PrePostFMRI(root_dir=args.data_root, transform=base_tfm, strict=False)
 
-    n_val   = max(1, int(len(ds) * val_frac))
-    n_train = len(ds) - n_val
-    g = torch.Generator().manual_seed(seed)
-    train_subset, val_subset = random_split(ds, [n_train, n_val], generator=g)
+    train_subset, val_subset = reconstruct_val_split(ds, val_frac, seed)
     val_indices  = list(val_subset.indices)
     full_indices = list(range(len(ds)))
-    print(f"Dataset: {len(ds)} subjects  (train={n_train}, val={n_val})\n")
+    print(f"Dataset: {len(ds)} subjects  (train={len(train_subset)}, val={len(val_subset)})\n")
 
     # ── model: EMA weights (same as training-time validation) ──────────────────
     model = build_cdm3d(

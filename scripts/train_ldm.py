@@ -13,23 +13,17 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, random_split
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from moyamoya.dataset import PrePostFMRI
-from moyamoya.transform import ToChannelsFirstAndNormalize
+from moyamoya.data import build_loaders
 from moyamoya.utils import seed_everything
 from moyamoya.models.ldm import build_paired_diffusion
 
 
-# ── visualisation helpers (mirrors infer_ldm.py) ─────────────────────────────
+# ── visualisation helpers ────────────────────────────────────────────────────
 
-def _to_np(vol: torch.Tensor) -> np.ndarray:
-    """(1, D, H, W) or (D, H, W) → (D, H, W) numpy, percentile-normalised."""
-    v = vol.squeeze().cpu().float().numpy()
-    lo, hi = np.percentile(v[v != 0], [1, 99]) if (v != 0).any() else (v.min(), v.max())
-    return np.clip((v - lo) / (hi - lo + 1e-8), 0, 1)
+from moyamoya.viz import percentile_norm as _to_np
 
 
 def _mid(arr: np.ndarray, axis: int) -> int:
@@ -103,19 +97,7 @@ def get_args():
 # ── data ─────────────────────────────────────────────────────────────────────
 
 def make_loaders(args):
-    tfm = ToChannelsFirstAndNormalize(nonzero_mask=True)
-    ds  = PrePostFMRI(root_dir=args.data_root, transform=tfm, strict=False)
-
-    n_val   = max(1, int(len(ds) * args.val_frac))
-    n_train = len(ds) - n_val
-    g = torch.Generator().manual_seed(args.seed)
-    train_ds, val_ds = random_split(ds, [n_train, n_val], generator=g)
-
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.num_workers, pin_memory=True)
-    val_dl   = DataLoader(val_ds,   batch_size=1, shuffle=False,
-                          num_workers=args.num_workers, pin_memory=True)
-    return train_dl, val_dl
+    return build_loaders(args, augment=False)
 
 
 # ── training ─────────────────────────────────────────────────────────────────

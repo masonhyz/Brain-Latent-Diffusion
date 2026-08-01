@@ -9,71 +9,21 @@ connections, so the conditioning signal propagates at every spatial scale.
 With eta=0 DDIM at inference the model behaves like deterministic regression.
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..modules import _match_size
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _ng(ch: int, max_g: int = 8) -> int:
-    """Largest divisor of ch that is ≤ max_g (for GroupNorm)."""
-    for g in range(min(ch, max_g), 0, -1):
-        if ch % g == 0:
-            return g
-    return 1
-
-
-def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
-    """t: (B,) int timesteps → (B, dim) sinusoidal embeddings."""
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(10000) * torch.arange(half, dtype=torch.float32, device=t.device) / (half - 1)
-    )
-    args = t.float().unsqueeze(1) * freqs.unsqueeze(0)   # (B, half)
-    return torch.cat([args.sin(), args.cos()], dim=1)     # (B, dim)
-
-
-def make_beta_schedule(T: int = 1000, schedule: str = "cosine") -> torch.Tensor:
-    if schedule == "linear":
-        return torch.linspace(1e-4, 0.02, T)
-    # cosine (Nichol & Dhariwal 2021)
-    s = 0.008
-    steps = torch.arange(T + 1, dtype=torch.float64) / T
-    alphas_bar = torch.cos((steps + s) / (1 + s) * math.pi / 2) ** 2
-    alphas_bar = alphas_bar / alphas_bar[0]
-    betas = 1.0 - alphas_bar[1:] / alphas_bar[:-1]
-    return betas.clamp(0.0, 0.999).float()
+from ..modules import (
+    _match_size,
+    sinusoidal_embedding,
+    make_beta_schedule,
+    ResBlock3D,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Denoising U-Net
 # ─────────────────────────────────────────────────────────────────────────────
-
-class ResBlock3D(nn.Module):
-    """Residual block with time-embedding injection (scale-shift style)."""
-    def __init__(self, in_ch: int, out_ch: int, t_dim: int):
-        super().__init__()
-        self.norm1  = nn.GroupNorm(_ng(in_ch), in_ch)
-        self.conv1  = nn.Conv3d(in_ch, out_ch, 3, padding=1)
-        self.t_proj = nn.Linear(t_dim, out_ch * 2)   # scale + shift
-        self.norm2  = nn.GroupNorm(_ng(out_ch), out_ch)
-        self.conv2  = nn.Conv3d(out_ch, out_ch, 3, padding=1)
-        self.skip   = nn.Conv3d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-        self.act    = nn.SiLU()
-
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(self.act(self.norm1(x)))
-        scale, shift = self.t_proj(t_emb).chunk(2, dim=1)
-        h = self.norm2(h) * (1 + scale[:, :, None, None, None]) + shift[:, :, None, None, None]
-        h = self.conv2(self.act(h))
-        return h + self.skip(x)
-
 
 class DiffusionUNet3D(nn.Module):
     """
@@ -254,6 +204,7 @@ class PairedDiffusion(nn.Module):
 
         # start from pure Gaussian noise
         x = torch.randn_like(x_pre)
+        zero_cond = torch.zeros_like(x_pre)  # loop-invariant CFG conditioning
 
         for i, t_val in enumerate(tau):
             t_batch    = t_val.expand(B)
@@ -261,7 +212,7 @@ class PairedDiffusion(nn.Module):
             pred_noise = self.denoiser(x_in, t_batch)
 
             if guidance_scale != 1.0:
-                x_in_uncond = torch.cat([x, torch.zeros_like(x_pre)], dim=1)
+                x_in_uncond = torch.cat([x, zero_cond], dim=1)
                 pred_uncond = self.denoiser(x_in_uncond, t_batch)
                 pred_noise  = pred_uncond + guidance_scale * (pred_noise - pred_uncond)
 

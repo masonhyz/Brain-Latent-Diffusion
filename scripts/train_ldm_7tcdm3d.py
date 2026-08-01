@@ -27,30 +27,18 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from skimage.metrics import structural_similarity
-from torch.utils.data import DataLoader, random_split
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from moyamoya.dataset import PrePostFMRI
-from moyamoya.transform import (
-    ToChannelsFirstAndNormalize,
-    PairedRandomFlip,
-    PairedRandomIntensityScale,
-    PairedCompose,
-)
+from moyamoya.data import build_loaders
 from moyamoya.utils import seed_everything, get_device
+from moyamoya.metrics import compute_metrics
 from moyamoya.models.ldm_7tcdm3d import build_paired_latent_diffusion_7tcdm
 from moyamoya.models.ldm3d import build_autoencoder
 
 
 # ── visualisation helpers (matching eval_ldm_7tcdm3d.py) ─────────────────────
 
-def _to_np(vol: torch.Tensor) -> np.ndarray:
-    v = vol.squeeze().cpu().float().numpy()
-    mask = v != 0
-    lo, hi = (np.percentile(v[mask], [1, 99]) if mask.any() else (v.min(), v.max()))
-    return np.clip((v - lo) / (hi - lo + 1e-8), 0, 1)
+from moyamoya.viz import percentile_norm as _to_np
 
 
 def _get_slices(vol_np: np.ndarray) -> dict:
@@ -96,33 +84,6 @@ def save_grid(
     plt.close(fig)
 
 
-# ── metrics ───────────────────────────────────────────────────────────────────
-
-def compute_metrics(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-) -> dict:
-    """MAE, MSE, PSNR, SSIM between pred and target within the brain mask."""
-    p = pred.squeeze().cpu().float().numpy()
-    t = target.squeeze().cpu().float().numpy()
-    m = mask.squeeze().cpu().bool().numpy()
-
-    mp, mt = p[m], t[m]
-    mae = float(np.abs(mp - mt).mean())
-    mse = float(((mp - mt) ** 2).mean())
-    data_range = float(mt.max() - mt.min()) if mt.max() > mt.min() else 1.0
-    psnr = float(10 * np.log10(data_range ** 2 / (mse + 1e-12)))
-
-    # SSIM over full 3D volume; data_range from brain-masked target (z-score space)
-    ssim_val = float(structural_similarity(
-        t, p,
-        data_range=data_range,
-        win_size=7,
-        channel_axis=None,
-    ))
-
-    return {"mae": mae, "mse": mse, "psnr": psnr, "ssim": ssim_val}
 
 
 # ── training progression plot ─────────────────────────────────────────────────
@@ -188,7 +149,7 @@ def plot_progression(out_dir: Path, stage: int) -> None:
         fig.suptitle(f"{out_dir.name} — Training Progression",
                      fontsize=14, fontweight="bold", y=0.98)
 
-        top_cols = 4 if has_s1 else 4
+        top_cols = 4
         gs = gridspec.GridSpec(2, top_cols, figure=fig, hspace=0.42, wspace=0.35)
 
         s2 = _load_metrics_csv(csv2)
@@ -330,40 +291,8 @@ def get_args():
 
 # ── data ─────────────────────────────────────────────────────────────────────
 
-class _AugmentedSubset(torch.utils.data.Dataset):
-    """Wraps a Subset and applies an extra paired augmentation at __getitem__."""
-    def __init__(self, subset, aug):
-        self.subset = subset
-        self.aug    = aug
-
-    def __len__(self):
-        return len(self.subset)
-
-    def __getitem__(self, idx):
-        x, y = self.subset[idx]
-        return self.aug(x, y)
-
-
 def make_loaders(args):
-    base_tfm = ToChannelsFirstAndNormalize(nonzero_mask=True)
-    ds = PrePostFMRI(root_dir=args.data_root, transform=base_tfm, strict=False)
-
-    n_val   = max(1, int(len(ds) * args.val_frac))
-    n_train = len(ds) - n_val
-    g = torch.Generator().manual_seed(args.seed)
-    train_subset, val_subset = random_split(ds, [n_train, n_val], generator=g)
-
-    aug = PairedCompose([
-        PairedRandomFlip(p=0.5),
-        PairedRandomIntensityScale(scale_range=(0.9, 1.1)),
-    ])
-    train_ds = _AugmentedSubset(train_subset, aug)
-
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.num_workers, pin_memory=True)
-    val_dl   = DataLoader(val_subset, batch_size=1, shuffle=False,
-                          num_workers=args.num_workers, pin_memory=True)
-    return train_dl, val_dl
+    return build_loaders(args, augment=True)
 
 
 # ── stage 1: autoencoder ─────────────────────────────────────────────────────
