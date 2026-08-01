@@ -1,11 +1,16 @@
 #!/bin/bash
 # Train the 7TCDM-3D latent diffusion model end-to-end (both stages).
-# Run from the project root:   bash scripts/train_7tcdm3d.sh [run_name]
+# Run from the project root:
+#   bash scripts/train_7tcdm3d.sh              # -> runs/ldm_7tcdm3d_<timestamp>/
+#   bash scripts/train_7tcdm3d.sh my_experiment   # -> runs/my_experiment/
 set -e
 
-RUN="${1:-ldm_7tcdm3d}"          # run name -> runs/<RUN>/
+# Default to a fresh timestamped run dir so a new kickoff never overwrites an
+# old one. Both stages share this dir. Pass a name to override.
+RUN="${1:-ldm_7tcdm3d_$(date +%Y-%m-%d_%H-%M-%S)}"
 OUT="runs/${RUN}"
 SEED=42
+echo "Run dir: ${OUT}"
 
 # ── Stage 1: KL-autoencoder ───────────────────────────────────────────────────
 python scripts/train_ldm_7tcdm3d.py \

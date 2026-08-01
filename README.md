@@ -149,18 +149,30 @@ Diffusion flags: `--diff_base`, `--t_dim`, `--n_levels`.
 
 ### 7TCDM-3D (latent diffusion, 2 stages)
 
-```bash
-# Stage 1
-python scripts/train_ldm_7tcdm3d.py --stage 1 --out_dir runs/ldm_7tcdm3d
+End-to-end (both stages, one shared run dir):
 
-# Stage 2
-python scripts/train_ldm_7tcdm3d.py --stage 2 \
-    --ae_ckpt runs/ldm_7tcdm3d/stage1_best.pt \
-    --out_dir runs/ldm_7tcdm3d --epochs 200
+```bash
+bash scripts/train_7tcdm3d.sh                 # -> runs/ldm_7tcdm3d_<timestamp>/
+bash scripts/train_7tcdm3d.sh my_experiment   # -> runs/my_experiment/
 ```
 
+Or run the stages directly. With **no `--out_dir`, stage 1 creates a fresh
+timestamped dir** (`runs/ldm_7tcdm3d_<YYYY-MM-DD_HH-MM-SS>/`) so a new kickoff
+never overwrites an old run; **stage 2 with no `--out_dir` defaults to the AE
+checkpoint's own directory**, so it always lands next to the stage 1 it builds on:
+
+```bash
+# Stage 1 — prints the timestamped dir it created
+python scripts/train_ldm_7tcdm3d.py --stage 1
+
+# Stage 2 — lands in runs/<that dir>/ automatically (same dir as the AE)
+python scripts/train_ldm_7tcdm3d.py --stage 2 \
+    --ae_ckpt runs/ldm_7tcdm3d_<timestamp>/stage1_best.pt --epochs 2000
+```
+
+Pass `--out_dir runs/<name>` to either stage to pin a specific directory.
 Denoiser flags: `--diff_dim`, `--diff_dim_mults`, `--init_kernel_size`, `--resnet_groups`.
-A full reproduction (both stages, seed 42) is scripted:
+A pinned-dir reproduction (both stages, seed 42) is scripted:
 
 ```bash
 bash scripts/repro_ldm_7tcdm3d.sh

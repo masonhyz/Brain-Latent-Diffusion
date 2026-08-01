@@ -344,8 +344,12 @@ def make_loaders(args):
 # ── stage 1: autoencoder ─────────────────────────────────────────────────────
 
 def train_stage1(args, device):
-    out_dir = Path(args.out_dir or "runs/ldm_7tcdm3d")
+    # Default to a fresh timestamped run dir so a new kickoff never overwrites
+    # an old one; pass --out_dir to reuse/resume a specific directory.
+    out_dir = Path(args.out_dir or f"runs/ldm_7tcdm3d_{datetime.now():%Y-%m-%d_%H-%M-%S}")
     out_dir.mkdir(parents=True, exist_ok=True)
+    args.out_dir = str(out_dir)
+    print(f"[Stage 1] logging to {out_dir}")
     install_run_logger(out_dir, stage=1)
 
     train_dl, val_dl = make_loaders(args)
@@ -421,8 +425,12 @@ def train_stage2(args, device):
     if args.ae_ckpt is None:
         raise ValueError("--ae_ckpt is required for stage 2")
 
-    out_dir = Path(args.out_dir or "runs/ldm_7tcdm3d")
+    # Default stage 2 into the same dir as its autoencoder, so it always lands
+    # next to the stage-1 checkpoint it builds on (never a new timestamped dir).
+    out_dir = Path(args.out_dir or Path(args.ae_ckpt).parent)
     out_dir.mkdir(parents=True, exist_ok=True)
+    args.out_dir = str(out_dir)
+    print(f"[Stage 2] logging to {out_dir}")
     install_run_logger(out_dir, stage=2)
     vis_dir = out_dir / "vis_stage2"
     vis_dir.mkdir(exist_ok=True)
