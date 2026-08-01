@@ -180,7 +180,13 @@ python scripts/eval_ldm_7tcdm3d.py --val_only      # validation split only
 python scripts/eval_ldm_7tcdm3d.py --no-grids      # metrics only, skip PNGs (fast)
 ```
 
-Metrics (MAE, MSE, PSNR, SSIM) are computed in z-score space, brain-masked. The
+All four metrics (MAE, MSE, PSNR, SSIM) are computed by one shared function
+(`moyamoya/metrics.py`) so training, eval, and every comparison script report the
+same numbers. They are scored in z-score space and **brain-masked** — including
+SSIM, whose per-voxel SSIM map is averaged over the brain mask (set
+`mask_ssim=False` for legacy whole-volume SSIM). PSNR and SSIM share one
+`data_range` (the masked target's max−min; pass a fixed value after rescaling to
+[0,1] for cross-study reporting). The
 7TCDM-3D eval writes `grids/<id>.png` (per-sample 3×3 grids, toggle with
 `--save_grids/--no-grids`), `metrics.csv` (per-sample) and `summary.json` (run config
 + aggregate mean/std/median/min/max). Sampling is seeded per subject

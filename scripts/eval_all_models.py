@@ -86,33 +86,10 @@ def unpad(vol: torch.Tensor, orig: tuple) -> torch.Tensor:
 
 def compute_metrics(pred: np.ndarray, target: np.ndarray,
                     mask: np.ndarray) -> dict:
-    """
-    pred, target, mask: 3D numpy arrays (D, H, W).
-    Metrics computed over brain-masked voxels.
-    SSIM/PSNR use the full volume with data_range = target range in mask.
-    """
-    p = pred[mask]
-    t = target[mask]
-
-    mae = float(np.abs(p - t).mean())
-    mse = float(((p - t) ** 2).mean())
-
-    data_range = float(target[mask].max() - target[mask].min())
-    if data_range < 1e-8:
-        data_range = 1.0
-
-    psnr = float(10 * np.log10(data_range ** 2 / (mse + 1e-12)))
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        ssim_val = ssim_fn(
-            target, pred,
-            data_range=data_range,
-            win_size=7,
-            channel_axis=None,
-        )
-
-    return {"MAE": mae, "MSE": mse, "SSIM": ssim_val, "PSNR": psnr}
+    """Uppercase-keyed wrapper around the shared metric (moyamoya.metrics)."""
+    from moyamoya.metrics import compute_metrics as _cm
+    m = _cm(pred, target, mask)
+    return {"MAE": m["mae"], "MSE": m["mse"], "SSIM": m["ssim"], "PSNR": m["psnr"]}
 
 
 # ── model loaders ─────────────────────────────────────────────────────────────

@@ -62,11 +62,12 @@ def _rescale01(v):
 
 
 def compute_metric(pred, target, region, bg=None, scale="zscore"):
-    """
-    MAE/MSE/PSNR over `region`; SSIM over the FULL volume (matches training).
-      scale='zscore'    -> raw z-score values; data_range = target's range in `region`
+    """All four metrics over `region` via the shared metric (moyamoya.metrics),
+    so numbers match training/eval exactly.
+      scale='zscore'    -> raw z-score values; data_range = masked target range
       scale='rescale01' -> min-max rescale each volume to [0,1]; data_range = 1
     """
+    from moyamoya.metrics import compute_metrics as _cm
     p = pred.squeeze().cpu().float().numpy()
     t = target.squeeze().cpu().float().numpy()
     if scale == "rescale01":
@@ -75,20 +76,7 @@ def compute_metric(pred, target, region, bg=None, scale="zscore"):
         b = bg.squeeze().cpu().bool().numpy()
         p[b] = 0.0; t[b] = 0.0
     m = region.squeeze().cpu().bool().numpy()
-    mp, mt = p[m], t[m]
-    mae = float(np.abs(mp - mt).mean())
-    mse = float(((mp - mt) ** 2).mean())
-    if scale == "rescale01":
-        dr = 1.0
-    else:
-        dr = float(mt.max() - mt.min()); dr = dr if dr > 0 else 1.0
-    psnr = float(10.0 * np.log10(dr ** 2 / (mse + 1e-12)))
-    # SSIM over the FULL volume (background included), matching training's
-    # compute_metrics — the scalar return is the whole-volume mean. data_range
-    # is still taken from the brain-masked target (z-score space).
-    ssim = float(structural_similarity(t, p, data_range=dr, win_size=7,
-                                       channel_axis=None))
-    return {"mae": mae, "mse": mse, "psnr": psnr, "ssim": ssim}
+    return _cm(p, t, m, data_range=(1.0 if scale == "rescale01" else None))
 
 
 # ── model dispatch: returns (model, generate_fn(x_b)->pred, short description) ──

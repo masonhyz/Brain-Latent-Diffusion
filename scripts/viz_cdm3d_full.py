@@ -107,11 +107,10 @@ def visualize_run(run: str, args, ds: PrePostFMRI, device) -> None:
 
         # Brain-masked EVALUATION only (numerical, never visual).  Vanilla z-score
         # maps the exactly-zero raw background to the per-volume minimum, so
-        # `!= min` recovers the brain.  Zero pred + target background before scoring:
-        # compute_metrics restricts MAE/MSE/PSNR to the mask but computes SSIM over
-        # the whole volume, so matched-zero backgrounds keep SSIM brain-driven.
+        # `!= min` recovers the brain.  All four metrics (incl. SSIM) are averaged
+        # over this mask, so no background pre-zeroing is needed.
         brain = (x_b != x_b.min()) | (y_b != y_b.min())
-        m = compute_metrics((pred * brain).float().cpu(), y_b * brain, brain)
+        m = compute_metrics(pred.float().cpu(), y_b, brain)
 
         # Visualization stays raw/vanilla — same as runs/<run>/vis/.
         title = f"{subject}   MAE={m['mae']:.3f}  SSIM={m['ssim']:.3f}"

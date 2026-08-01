@@ -57,10 +57,10 @@ def evaluate(model, indices, ds, guidance_scale, device, tag):
         with torch.no_grad():
             pred = model.sample(x_b, guidance_scale=guidance_scale)
         # Brain-masked eval: vanilla z-score puts the zero background at the volume
-        # minimum, so `!= min` recovers the brain. Zero pred + target background so
-        # the whole-volume SSIM stays brain-driven (MAE/MSE/PSNR use the mask).
+        # minimum, so `!= min` recovers the brain. All four metrics (incl. SSIM) are
+        # averaged over this mask, so no background pre-zeroing is needed.
         brain = (x_b != x_b.min()) | (y_b != y_b.min())
-        m = compute_metrics((pred * brain).float().cpu(), y_b * brain, brain)
+        m = compute_metrics(pred.float().cpu(), y_b, brain)
         m["subject"] = sample_id
         records.append(m)
         if (i + 1) % 10 == 0 or (i + 1) == n:

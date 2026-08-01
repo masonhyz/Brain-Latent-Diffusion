@@ -30,14 +30,12 @@ LDM3D_GUIDANCE_SCALE = 1.0
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def compute_metrics(pred: np.ndarray, target: np.ndarray, mask: np.ndarray):
-    """All arrays: [D, H, W] float32, z-scored."""
-    p, t = pred[mask], target[mask]
-    mae  = float(np.abs(p - t).mean())
-    mse  = float(((p - t) ** 2).mean())
-    dr   = float(target.max() - target.min())
-    ssim = structural_similarity(pred, target, data_range=dr)
-    psnr = peak_signal_noise_ratio(target, pred, data_range=dr)
-    return mae, mse, ssim, psnr
+    """All arrays: [D, H, W] float32, z-scored. Delegates to the shared metric
+    (moyamoya.metrics) so numbers match training/eval exactly; returns the tuple
+    order (mae, mse, ssim, psnr) expected by ``accumulate``."""
+    from moyamoya.metrics import compute_metrics as _cm
+    m = _cm(pred, target, mask)
+    return m["mae"], m["mse"], m["ssim"], m["psnr"]
 
 
 def accumulate(results, mae, mse, ssim, psnr):
