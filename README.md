@@ -175,12 +175,16 @@ bash scripts/repro_ldm_7tcdm3d.sh
 python scripts/eval_cdm3d.py --ckpt runs/cdm3d/best.pt --ddim_steps 50
 
 # 7TCDM-3D latent diffusion — writes to outputs/eval/ldm_7tcdm3d/
-python scripts/eval_ldm_7tcdm3d.py
+python scripts/eval_ldm_7tcdm3d.py                 # full dataset
+python scripts/eval_ldm_7tcdm3d.py --val_only      # validation split only
+python scripts/eval_ldm_7tcdm3d.py --no-grids      # metrics only, skip PNGs (fast)
 ```
 
 Metrics (MAE, MSE, PSNR, SSIM) are computed in z-score space, brain-masked. The
-7TCDM-3D eval writes `grids/<id>.png` (per-sample 3×3 grids), `metrics.csv`
-(per-sample) and `summary.json` (run config + aggregate mean/std/median/min/max).
+7TCDM-3D eval writes `grids/<id>.png` (per-sample 3×3 grids, toggle with
+`--save_grids/--no-grids`), `metrics.csv` (per-sample) and `summary.json` (run config
++ aggregate mean/std/median/min/max). Sampling is seeded per subject
+(`--sample_seed`), so results are reproducible and match single-subject runs.
 
 ### Evaluate all models together
 
@@ -191,16 +195,20 @@ python scripts/eval_all_models.py
 Runs UNet, CycleGAN, LDM-3D and 7TCDM-3D on the full paired dataset and reports a
 unified metrics table. (Edit the checkpoint paths at the top of the script.)
 
-### Export a prediction as NIfTI
+### Predict one subject + export NIfTI
 
-Generate a prediction for one subject and write the full predicted volume back to
-`.nii.gz` in the original geometry (source affine/header), plus a 3×3 PNG grid and a
-`metrics.json`. Defaults to `outputs/predict/<subject>/`:
+Single-subject prediction is a mode of the same eval script (`--subject`, plus
+`--save_nii` to write the full predicted volume back to `.nii.gz` in the original
+geometry). Defaults to `outputs/predict/<subject>/`; use `--n_samples N` to average an
+ensemble of DDIM draws:
 
 ```bash
-python scripts/predict_ldm_7tcdm3d_nii.py --ckpt runs/ldm_7tcdm3d/stage2_best.pt \
-    --subject 2024_040 --seed 0
+python scripts/eval_ldm_7tcdm3d.py --ckpt runs/ldm_7tcdm3d/stage2_best.pt \
+    --subject 2024_040 --save_nii --sample_seed 0
 ```
+
+> `scripts/predict_ldm_7tcdm3d_nii.py` still works as a thin deprecated shim that
+> forwards to the command above.
 
 ### Comparison plots & figures
 
@@ -211,14 +219,19 @@ python scripts/predict_ldm_7tcdm3d_nii.py --ckpt runs/ldm_7tcdm3d/stage2_best.pt
 ## Checkpoints
 
 ```
-runs/<name>/stage1_best.pt   # LDM autoencoder (2-stage models)
-runs/<name>/stage2_best.pt   # LDM diffusion UNet
+runs/<name>/stage1_best.pt   # LDM autoencoder (2-stage models) — the only copy of the AE
+runs/<name>/stage2_best.pt   # LDM diffusion UNet (denoiser); references the AE, not embedded
 runs/<name>/best.pt          # single-stage models (CDM3D, PairedDiffusion) — best val
 runs/<name>/last.pt          # latest epoch
 ```
 
 Checkpoints embed their build `args`, so eval/predict scripts reconstruct the exact model
-variant from the checkpoint alone.
+variant from the checkpoint alone. The AE is frozen during stage 2, so stage-2 checkpoints
+store **only the denoiser** plus an `ae_ckpt` reference — they do not duplicate the ~160 MB
+AE. Loading is handled by `moyamoya.models.ldm_7tcdm3d.load_7tcdm3d_checkpoint`, which
+resolves the AE from `stage1_best.pt` (or `--ae_ckpt`), and still reads legacy checkpoints
+that embed the AE. **Keep `stage1_best.pt` alongside the stage-2 files** — it is required to
+load them.
 
 ## Outputs & logging
 
@@ -231,18 +244,19 @@ runs/<name>/                    # one training run (7TCDM-3D shown)
   hparams_stage{1,2}.json       # args + dataset split + timestamp + git commit
   metrics_stage{1,2}.csv        # per-epoch scalars (the durable history)
   train_stage{1,2}.log          # full console output, teed per run (append)
-  stage{1,2}_{best,last}.pt     # checkpoints (embed build args; frozen AE in stage 2)
-  stage2_best_{mae,mse,psnr,ssim}.pt   # per-metric best checkpoints
+  stage1_{best,last}.pt         # autoencoder (the sole AE copy)
+  stage2_{best,last}.pt         # denoiser only (+ ae_ckpt reference; AE not duplicated)
+  stage2_best_{mae,mse,psnr,ssim}.pt   # per-metric best checkpoints (denoiser only)
   vis_stage2/epoch_XXXX.png     # sampled val grid every --vis_every epochs
   training_progression*.png     # summary plot, rebuilt from the CSVs
 
-outputs/
-  eval/<run>/                   # scripts/eval_ldm_7tcdm3d.py
-    grids/<id>.png              #   per-sample 3×3 grids
-    metrics.csv                 #   per-sample metrics
-    summary.json                #   run config + aggregate stats
-  predict/<subject>/            # scripts/predict_ldm_7tcdm3d_nii.py
-    <subject>.png, <subject>_pred.nii.gz, metrics.json
+outputs/                        # both trees written by scripts/eval_ldm_7tcdm3d.py
+  eval/<run>/                   #   full-dataset / --val_only runs
+    grids/<id>.png              #     per-sample 3×3 grids (--save_grids)
+    metrics.csv                 #     per-sample metrics
+    summary.json                #     run config + aggregate stats
+  predict/<subject>/            #   --subject runs
+    grids/<subject>.png, <subject>_pred.nii.gz (--save_nii), metrics.csv, summary.json
 ```
 
 ---

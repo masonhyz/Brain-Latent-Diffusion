@@ -221,22 +221,9 @@ def load_ldm3d(ckpt_path: str, device: torch.device):
 
 
 def load_7tcdm(ckpt_path: str, device: torch.device):
-    from moyamoya.models.ldm_7tcdm3d import build_paired_latent_diffusion_7tcdm
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    from moyamoya.models.ldm_7tcdm3d import load_7tcdm3d_checkpoint
+    model, ck = load_7tcdm3d_checkpoint(ckpt_path, device)   # resolves AE (embedded or referenced)
     a = ck["args"]
-    model = build_paired_latent_diffusion_7tcdm(
-        z_channels=a["z_channels"], embed_dim=a["embed_dim"],
-        ae_ch=a["ae_ch"], ae_ch_mult=tuple(a.get("ae_ch_mult", [1, 2, 4])),
-        ae_res_blocks=a["ae_res_blocks"], ae_resolution=a["ae_resolution"],
-        kl_weight=a["kl_weight"],
-        diff_dim=a["diff_dim"], diff_dim_mults=tuple(a["diff_dim_mults"]),
-        init_kernel_size=a.get("init_kernel_size", 3),
-        resnet_groups=a.get("resnet_groups", 8),
-        T=a["T"],
-    ).to(device)
-    model.ae.load_state_dict(ck["ae"])
-    model.denoiser.load_state_dict(ck["denoiser"])
-    model.eval()
     print(f"  7TCDM-3D loaded  from {ckpt_path}")
     return model, a.get("ddim_steps", 50), a.get("guidance_scale", 3.0)
 

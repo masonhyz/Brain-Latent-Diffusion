@@ -24,7 +24,7 @@ from moyamoya.viz import save_ortho_grid
 
 # ── per-model checkpoint loaders ──────────────────────────────────────────────
 
-def _load_ldm(a, ckpt, device):
+def _load_ldm(a, ckpt, device, ckpt_path):
     from moyamoya.models.ldm import build_paired_diffusion
     model = build_paired_diffusion(
         base=a["diff_base"], t_dim=a["t_dim"], n_levels=a["n_levels"], T=a["T"],
@@ -33,7 +33,7 @@ def _load_ldm(a, ckpt, device):
     return model
 
 
-def _load_ldm3d(a, ckpt, device):
+def _load_ldm3d(a, ckpt, device, ckpt_path):
     from moyamoya.models.ldm3d import build_paired_latent_diffusion
     model = build_paired_latent_diffusion(
         z_channels=a.get("z_channels", 4),
@@ -52,23 +52,11 @@ def _load_ldm3d(a, ckpt, device):
     return model
 
 
-def _load_ldm_7tcdm3d(a, ckpt, device):
-    from moyamoya.models.ldm_7tcdm3d import build_paired_latent_diffusion_7tcdm
-    model = build_paired_latent_diffusion_7tcdm(
-        z_channels=a.get("z_channels", 4),
-        embed_dim=a.get("embed_dim", 4),
-        ae_ch=a.get("ae_ch", 64),
-        ae_res_blocks=a.get("ae_res_blocks", 2),
-        ae_resolution=a.get("ae_resolution", 64),
-        kl_weight=a.get("kl_weight", 1e-6),
-        diff_dim=a.get("diff_dim", 32),
-        diff_dim_mults=tuple(a.get("diff_dim_mults", [1, 2, 4, 8])),
-        init_kernel_size=a.get("init_kernel_size", 3),
-        resnet_groups=a.get("resnet_groups", 8),
-        T=a.get("T", 1000),
-    ).to(device)
-    model.ae.load_state_dict(ckpt["ae"])
-    model.denoiser.load_state_dict(ckpt["denoiser"])
+def _load_ldm_7tcdm3d(a, ckpt, device, ckpt_path):
+    # Centralized loader resolves the frozen AE whether it is embedded (legacy)
+    # or referenced via ae_ckpt (deduplicated), and reads every arch field.
+    from moyamoya.models.ldm_7tcdm3d import load_7tcdm3d_checkpoint
+    model, _ = load_7tcdm3d_checkpoint(ckpt_path, device)
     return model
 
 
@@ -82,8 +70,8 @@ MODELS = {
 
 def load_model(model_name: str, ckpt_path: str, device: torch.device):
     loader = MODELS[model_name][0]
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model = loader(ckpt["args"], ckpt, device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model = loader(ckpt["args"], ckpt, device, ckpt_path)
     model.eval()
     return model
 

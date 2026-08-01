@@ -18,6 +18,7 @@ Key changes from 7TCDM's 2-D Unet3D:
 """
 
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -200,3 +201,75 @@ def build_paired_latent_diffusion_7tcdm(
         resnet_groups=resnet_groups,
     )
     return PairedLatentDiffusion(ae=ae, denoiser=denoiser, T=T, schedule=schedule)
+
+
+# ── checkpoint loading ────────────────────────────────────────────────────────
+
+def build_from_args(args: dict, device="cpu") -> PairedLatentDiffusion:
+    """Reconstruct the exact model variant from a checkpoint's ``args`` dict.
+
+    Reads *every* architecture field (incl. ``ae_ch_mult`` and ``schedule``),
+    so it never silently falls back to a default that mis-shapes the AE.
+    """
+    a = args
+    return build_paired_latent_diffusion_7tcdm(
+        z_channels       = a["z_channels"],
+        embed_dim        = a["embed_dim"],
+        ae_ch            = a["ae_ch"],
+        ae_ch_mult       = tuple(a.get("ae_ch_mult", (1, 2, 4))),
+        ae_res_blocks    = a["ae_res_blocks"],
+        ae_resolution    = a["ae_resolution"],
+        kl_weight        = a["kl_weight"],
+        diff_dim         = a["diff_dim"],
+        diff_dim_mults   = tuple(a["diff_dim_mults"]),
+        init_kernel_size = a.get("init_kernel_size", 3),
+        resnet_groups    = a.get("resnet_groups", 8),
+        T                = a["T"],
+        schedule         = a.get("schedule", "cosine"),
+    ).to(device)
+
+
+def _resolve_ae_state_dict(raw: dict, ckpt_path, ae_ckpt=None, device="cpu") -> dict:
+    """Locate the frozen AE weights for a stage-2 checkpoint.
+
+    Resolution order:
+      1. explicit ``ae_ckpt`` override,
+      2. AE embedded in the checkpoint (legacy self-contained format),
+      3. the ``ae_ckpt`` reference stored in the checkpoint (as given, then by
+         basename next to the stage-2 file),
+      4. a sibling ``stage1_best.pt`` in the same run directory.
+    """
+    if ae_ckpt is not None:
+        return torch.load(ae_ckpt, map_location=device, weights_only=False)["ae"]
+    if "ae" in raw:                                   # legacy embedded AE
+        return raw["ae"]
+
+    run_dir = Path(ckpt_path).resolve().parent
+    candidates = []
+    ref = raw.get("ae_ckpt")
+    if ref:
+        candidates += [Path(ref), run_dir / Path(ref).name]
+    candidates.append(run_dir / "stage1_best.pt")
+    for c in candidates:
+        if c.is_file():
+            return torch.load(c, map_location=device, weights_only=False)["ae"]
+    raise FileNotFoundError(
+        f"Could not locate the frozen AE for stage-2 checkpoint {ckpt_path}. "
+        f"Tried: {[str(c) for c in candidates]}. Pass an explicit ae_ckpt=."
+    )
+
+
+def load_7tcdm3d_checkpoint(ckpt_path, device="cpu", ae_ckpt=None):
+    """Rebuild a 7TCDM-3D latent-diffusion model from a stage-2 checkpoint.
+
+    Handles both the legacy self-contained format ({ae, denoiser, args}) and the
+    deduplicated format ({denoiser, args, ae_ckpt}) where the frozen AE lives
+    only in ``stage1_best.pt``. Returns ``(model, raw)`` with the model in eval
+    mode on ``device``; ``raw`` is the loaded checkpoint dict.
+    """
+    raw = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model = build_from_args(raw["args"], device=device)
+    model.denoiser.load_state_dict(raw["denoiser"])
+    model.ae.load_state_dict(_resolve_ae_state_dict(raw, ckpt_path, ae_ckpt, device))
+    model.eval()
+    return model, raw

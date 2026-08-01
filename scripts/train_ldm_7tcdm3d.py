@@ -510,10 +510,14 @@ def train_stage2(args, device):
 
         _append_metrics_row(csv_path, epoch, tr_loss, val_loss, epoch_metrics)
 
+        # AE is frozen in stage 2, so it is NOT duplicated into every stage-2
+        # checkpoint; it lives once in stage1_best.pt and is referenced here.
+        # Loaders (moyamoya.models.ldm_7tcdm3d.load_7tcdm3d_checkpoint) resolve
+        # it from this reference, or fall back to a sibling stage1_best.pt.
         ckpt = {
-            "ae":       model.ae.state_dict(),
             "denoiser": model.denoiser.state_dict(),
             "args":     vars(args),
+            "ae_ckpt":  args.ae_ckpt,
         }
         torch.save(ckpt, out_dir / "stage2_last.pt")
         if val_loss < best_val:

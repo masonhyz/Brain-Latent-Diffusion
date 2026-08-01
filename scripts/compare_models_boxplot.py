@@ -98,27 +98,19 @@ def load_generate_fn(ckpt_path, mtype, device):
     raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     a = raw["args"]
     if mtype == "auto":
-        if "ae" in raw and "denoiser" in raw:
-            mtype = "ldm7t"
-        elif "ema_model" in raw:
+        # cdm3d keys on ema_model; ldm7t on denoiser (its AE may be embedded in
+        # legacy checkpoints or referenced via ae_ckpt in deduplicated ones).
+        if "ema_model" in raw:
             mtype = "cdm3d"
+        elif "denoiser" in raw:
+            mtype = "ldm7t"
         else:
             raise ValueError(f"Cannot auto-detect model type for {ckpt_path} "
                              f"(keys={list(raw.keys())}); pass --types")
 
     if mtype == "ldm7t":
-        from moyamoya.models.ldm_7tcdm3d import build_paired_latent_diffusion_7tcdm
-        model = build_paired_latent_diffusion_7tcdm(
-            z_channels=a["z_channels"], embed_dim=a["embed_dim"], ae_ch=a["ae_ch"],
-            ae_ch_mult=tuple(a["ae_ch_mult"]), ae_res_blocks=a["ae_res_blocks"],
-            ae_resolution=a["ae_resolution"], kl_weight=a["kl_weight"],
-            diff_dim=a["diff_dim"], diff_dim_mults=tuple(a["diff_dim_mults"]),
-            init_kernel_size=a["init_kernel_size"], resnet_groups=a["resnet_groups"], T=a["T"],
-            schedule=a.get("schedule", "cosine"),
-        ).to(device)
-        model.ae.load_state_dict(raw["ae"])
-        model.denoiser.load_state_dict(raw["denoiser"])
-        model.eval()
+        from moyamoya.models.ldm_7tcdm3d import load_7tcdm3d_checkpoint
+        model, _ = load_7tcdm3d_checkpoint(ckpt_path, device)   # resolves AE (embedded or referenced)
         ddim, gs = a.get("ddim_steps", 50), a.get("guidance_scale", 3.0)
         fn = lambda x: model.generate(x, ddim_steps=ddim, eta=0.0, guidance_scale=gs)
         return model, fn, f"ldm7t(ddim={ddim},gs={gs})"

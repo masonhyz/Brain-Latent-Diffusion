@@ -77,20 +77,8 @@ def main():
 
     # ── pass 1: 7TCDM-3D ─────────────────────────────────────────────────────
     print("\n--- 7TCDM-3D pass ---")
-    raw = torch.load(TCDM_CKPT, map_location="cpu", weights_only=False)
-    a   = raw["args"]
-    tcdm = build_paired_latent_diffusion_7tcdm(
-        z_channels=a["z_channels"], embed_dim=a["embed_dim"],
-        ae_ch=a["ae_ch"], ae_ch_mult=tuple(a.get("ae_ch_mult", [1,2,4])),
-        ae_res_blocks=a["ae_res_blocks"], ae_resolution=a["ae_resolution"],
-        kl_weight=a["kl_weight"], diff_dim=a["diff_dim"],
-        diff_dim_mults=tuple(a["diff_dim_mults"]),
-        init_kernel_size=a["init_kernel_size"], resnet_groups=a["resnet_groups"],
-        T=a["T"],
-    ).to(device)
-    tcdm.ae.load_state_dict(raw["ae"])
-    tcdm.denoiser.load_state_dict(raw["denoiser"])
-    tcdm.eval()
+    from moyamoya.models.ldm_7tcdm3d import load_7tcdm3d_checkpoint
+    tcdm, raw = load_7tcdm3d_checkpoint(TCDM_CKPT, device)   # resolves AE (embedded or referenced)
     for p in tcdm.parameters(): p.requires_grad_(False)
 
     for idx in range(len(ds)):
