@@ -80,10 +80,13 @@ time. Sampling uses DDIM (`eta=0` → deterministic).
 
 ### 1. Clone third-party dependencies
 
+The external repos are not vendored; clone them into `third_party/`. See
+[third_party/README.md](third_party/README.md) for the full list, exact paths, and
+which model uses each.
+
 ```bash
 mkdir -p third_party
 git clone https://github.com/CompVis/latent-diffusion third_party/latent-diffusion
-# 7TCDM source architecture (ported into cdm3d / ldm_7tcdm3d)
 # Legacy CycleGAN backends:
 git clone https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix third_party/pytorch-CycleGAN-and-pix2pix
 git clone https://github.com/arnab39/cycleGAN-PyTorch third_party/3D-CycleGan-Pytorch-MedImaging
