@@ -1,16 +1,24 @@
 """
-save_pair_plots.py
+qc.py
 
-Save a comparison plot for EVERY (pre, post) pair in PrePostFMRI:
-- loads dataset with your training-time transform
+Quality-control montages for EVERY (pre, post) pair in the fmri dataset.
+This script lives inside the fmri/ folder, alongside the pre_surgery and
+6_months_post_surgery folders. By default it scans that same folder and writes
+one PNG per subject into a sibling `qc/` folder, so you can flip through every
+scan and spot degeneracies.
+
+- loads dataset with the training-time transform
 - for each sample, saves a 3x2 montage of orthogonal mid-slices:
     rows: axial / coronal / sagittal
     cols: pre / post GT
 
-Usage:
-  python save_pair_plots.py \
+Usage (from anywhere; defaults assume this file sits in fmri/):
+  python fmri/qc.py
+
+Or override any default:
+  python fmri/qc.py \
     --data_root /path/to/fmri \
-    --out_dir ./pair_plots \
+    --out_dir /path/to/fmri/qc \
     --max_items -1 \
     --pre_dirname pre_surgery \
     --post_dirname 6_months_post_surgery \
@@ -22,7 +30,12 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# This file lives in <repo>/fmri/. The moyamoya package is at <repo>/moyamoya,
+# i.e. one level up from this file's parent, so importing it keeps working after
+# the move from scripts/ to fmri/.
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR.parent))
 from typing import Dict
 
 import numpy as np
@@ -82,12 +95,16 @@ def save_pair_figure(x_chdhw: np.ndarray, y_chdhw: np.ndarray, meta: Dict, out_p
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", type=str, required=True)
+    # Default to the folder this script lives in (fmri/), so it works out of the
+    # box without arguments.
+    p.add_argument("--data_root", type=str, default=str(SCRIPT_DIR))
     p.add_argument("--pre_dirname", type=str, default="pre_surgery")
     p.add_argument("--post_dirname", type=str, default="6_months_post_surgery")
     p.add_argument("--strict", action="store_true", default=True)
 
-    p.add_argument("--out_dir", type=str, required=True)
+    # Default output is a sibling `qc/` folder next to pre_surgery and
+    # 6_months_post_surgery inside data_root.
+    p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--max_items", type=int, default=-1, help="-1 means all items")
     p.add_argument("--print_every", type=int, default=50)
 
@@ -107,7 +124,8 @@ def main():
         return_paths=True,
     )
 
-    out_dir = Path(args.out_dir)
+    # Place qc/ as a sibling of pre_surgery / 6_months_post_surgery inside data_root.
+    out_dir = Path(args.out_dir) if args.out_dir else Path(args.data_root) / "qc"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     n = len(ds) if args.max_items < 0 else min(len(ds), args.max_items)

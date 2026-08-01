@@ -1,8 +1,9 @@
 # Third-party repositories (clone separately — see README)
 third_party/
 
-# Data
-fmri/
+# Data (but keep the QC script that lives alongside it)
+fmri/*
+!fmri/qc.py
 
 # Training artifacts
 checkpoints/
