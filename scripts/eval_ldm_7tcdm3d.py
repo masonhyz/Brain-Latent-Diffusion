@@ -29,13 +29,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import torch
-from torch.utils.data import random_split
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from skimage.metrics import structural_similarity
 
 from moyamoya.dataset import PrePostFMRI
+from moyamoya.data import reconstruct_val_split
+from moyamoya.metrics import compute_metrics
 from moyamoya.transform import ToChannelsFirstAndNormalize
 from moyamoya.models.ldm_7tcdm3d import build_paired_latent_diffusion_7tcdm
 
@@ -44,11 +44,7 @@ from moyamoya.models.ldm_7tcdm3d import build_paired_latent_diffusion_7tcdm
 # Visualisation helpers
 # ---------------------------------------------------------------------------
 
-def _to_np(vol: torch.Tensor) -> np.ndarray:
-    v = vol.squeeze().cpu().float().numpy()
-    mask = v != 0
-    lo, hi = (np.percentile(v[mask], [1, 99]) if mask.any() else (v.min(), v.max()))
-    return np.clip((v - lo) / (hi - lo + 1e-8), 0, 1)
+from moyamoya.viz import percentile_norm as _to_np
 
 
 def _get_slices(vol_np: np.ndarray) -> dict:
@@ -103,18 +99,6 @@ def save_grid(
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_metrics(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> dict:
-    p = pred.squeeze().cpu().float().numpy()
-    t = target.squeeze().cpu().float().numpy()
-    m = mask.squeeze().cpu().bool().numpy()
-
-    mp, mt = p[m], t[m]
-    mae = float(np.abs(mp - mt).mean())
-    mse = float(((mp - mt) ** 2).mean())
-    data_range = float(mt.max() - mt.min()) if mt.max() > mt.min() else 1.0
-    psnr = float(10 * np.log10(data_range ** 2 / (mse + 1e-12)))
-    ssim = float(structural_similarity(t, p, data_range=data_range, win_size=7, channel_axis=None))
-    return {"mae": mae, "mse": mse, "psnr": psnr, "ssim": ssim}
 
 
 # ---------------------------------------------------------------------------
@@ -187,12 +171,9 @@ def main():
     if args.val_only:
         val_frac = args.val_frac or ckpt_args.get("val_frac", 0.15)
         seed     = args.seed     or ckpt_args.get("seed",     42)
-        n_val    = max(1, int(len(ds) * val_frac))
-        n_train  = len(ds) - n_val
-        g = torch.Generator().manual_seed(seed)
-        _, val_subset = random_split(ds, [n_train, n_val], generator=g)
+        _, val_subset = reconstruct_val_split(ds, val_frac, seed)
         eval_set = val_subset
-        print(f"Val-only mode: {n_val} val samples (val_frac={val_frac}, seed={seed})")
+        print(f"Val-only mode: {len(val_subset)} val samples (val_frac={val_frac}, seed={seed})")
     else:
         eval_set = ds
 

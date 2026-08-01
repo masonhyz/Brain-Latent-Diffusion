@@ -30,23 +30,12 @@ class ToChannelsFirstAndNormalize:
             raise ValueError(f"Expected 3D or 4D tensor, got shape {tuple(t.shape)}")
 
     def _zscore(self, t: torch.Tensor) -> torch.Tensor:
-        if self.nonzero_mask:
-            mask = t != 0
-            if mask.any():
-                vals = t[mask]
-                mean = vals.mean()
-                std = vals.std(unbiased=False).clamp_min(self.eps)
-                t = (t - mean) / std
-            else:
-                # fallback: global
-                mean = t.mean()
-                std = t.std(unbiased=False).clamp_min(self.eps)
-                t = (t - mean) / std
-        else:
-            mean = t.mean()
-            std = t.std(unbiased=False).clamp_min(self.eps)
-            t = (t - mean) / std
-        return t
+        # Stats over nonzero voxels when masking (falling back to global if the
+        # volume is all-zero); over the whole volume otherwise.
+        mask = (t != 0) if self.nonzero_mask else torch.ones_like(t, dtype=torch.bool)
+        vals = t[mask] if mask.any() else t
+        std = vals.std(unbiased=False).clamp_min(self.eps)
+        return (t - vals.mean()) / std
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self._reorder(x)
