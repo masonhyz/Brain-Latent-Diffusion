@@ -329,6 +329,28 @@ def get_args():
                    help="Number of CV folds (used only when --fold is set)")
     p.add_argument("--fold",        type=int,   default=None,
                    help="Held-out fold index 0..n_folds-1. Unset = --val_frac holdout.")
+    # ── train-time data augmentation (paired pre/post) ───────────────────────
+    # Master toggle + per-transform strengths. Every strength is "0 = disabled",
+    # so any single transform can be turned off by passing its flag as 0, and the
+    # whole suite off with --no-augment. Resolved values are logged to hparams.
+    # Spatial transforms (flip/rotate) are applied identically to pre & post to
+    # preserve voxel correspondence; intensity/noise are drawn independently.
+    p.add_argument("--augment",    dest="augment", action="store_true",
+                   help="Enable train-time augmentation (on by default)")
+    p.add_argument("--no-augment", dest="augment", action="store_false")
+    p.set_defaults(augment=True)
+    p.add_argument("--aug_flip_p",          type=float, default=0.5,
+                   help="Prob of left-right flip (0 disables)")
+    p.add_argument("--aug_rotate_deg",      type=float, default=10.0,
+                   help="Max |rotation| per axis in degrees (0 disables)")
+    p.add_argument("--aug_intensity_scale", type=float, default=0.1,
+                   help="Multiplicative intensity scale ∈ [1-s, 1+s] (0 disables)")
+    p.add_argument("--aug_intensity_shift", type=float, default=0.1,
+                   help="Additive intensity shift ∈ [-s, s] (0 disables)")
+    p.add_argument("--aug_gamma",           type=float, default=0.1,
+                   help="Sign-preserving gamma ∈ [1-g, 1+g] (0 disables)")
+    p.add_argument("--aug_noise_std",       type=float, default=0.1,
+                   help="Additive Gaussian noise std in z-scored units (0 disables)")
     # training
     p.add_argument("--epochs",      type=int,   default=None,
                    help="Override epochs (default: 200 for stage 1, 1000 for stage 2)")
@@ -500,7 +522,14 @@ def _wandb_finish(run) -> None:
 # ── data ─────────────────────────────────────────────────────────────────────
 
 def make_loaders(args):
-    return build_loaders(args, augment=True)
+    if args.augment:
+        print("[augment] flip_p={} rotate_deg={} intensity_scale={} "
+              "intensity_shift={} gamma={} noise_std={}".format(
+                  args.aug_flip_p, args.aug_rotate_deg, args.aug_intensity_scale,
+                  args.aug_intensity_shift, args.aug_gamma, args.aug_noise_std))
+    else:
+        print("[augment] disabled (--no-augment)")
+    return build_loaders(args, augment=args.augment)
 
 
 # ── stage 1: autoencoder ─────────────────────────────────────────────────────
