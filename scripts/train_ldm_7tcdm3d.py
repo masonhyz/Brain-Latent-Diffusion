@@ -443,7 +443,7 @@ def init_wandb(args, out_dir: Path, stage: int, n_train: int, n_val: int):
         group = args.wandb_group
     else:
         name  = out_dir.parent.name if re.fullmatch(r"fold\d+", out_dir.name) else out_dir.name
-        group = re.sub(r"_(stage1_ae|stage1|ae|fold\d+)$|_stage2_.*$|_cv$", "", name)
+        group = re.sub(r"_(stage1_ae|stage1|ae|fold\d+)$|_stage2(_.*)?$|_cv$", "", name)
     fold  = getattr(args, "fold", None)
     config = dict(vars(args))
     config.update(stage=stage, n_train=n_train, n_val=n_val,
@@ -593,23 +593,21 @@ def train_stage1(args, device):
 # ── stage 2: latent diffusion ─────────────────────────────────────────────────
 
 def _default_stage2_out_dir(ae_ckpt: str, fold) -> Path:
-    """A fresh stage-2 run dir that is a SIBLING of the AE's dir (never inside it).
+    """A fresh, timestamp-named stage-2 run dir, a SIBLING of the AE's dir.
 
-    Stage 1 is rarely retrained, so stage 2 gets its own timestamped folder rather
-    than dumping next to the frozen AE checkpoint. An experiment stem is derived
-    from the AE dir name (stripping a trailing ``_stage1_ae`` / ``_ae`` /
-    ``_stage1``); the run lands at ``<stem>_stage2_<timestamp>``. A k-fold run
-    (``fold`` set) nests as ``<stem>_stage2_<timestamp>_cv/fold<N>`` — but real
-    k-fold sweeps pass an explicit ``--out_dir`` per fold (via train_7tcdm3d.sh)
-    so all folds share one parent.
+    Stage 1 is rarely retrained, so stage 2 gets its own folder rather than
+    dumping next to the frozen AE. Runs are identified purely by timestamp — no
+    experiment name needed: the run lands at ``<ts>_stage2``. A k-fold run
+    (``fold`` set) nests as ``<ts>_stage2_cv/fold<N>`` — but real k-fold sweeps
+    pass an explicit ``--out_dir`` per fold (via train_7tcdm3d.sh) so all folds
+    share one parent. The AE is still recoverable at eval time from the ``ae_ckpt``
+    path stored in the stage-2 checkpoint, so folder proximity is unnecessary.
     """
-    ae_dir = Path(ae_ckpt).resolve().parent
-    stem   = re.sub(r"_(stage1_ae|stage1|ae)$", "", ae_dir.name)
-    ts     = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    runs   = ae_dir.parent                       # e.g. runs/
+    runs = Path(ae_ckpt).resolve().parent.parent   # e.g. runs/
+    ts   = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if fold is not None:
-        return runs / f"{stem}_stage2_{ts}_cv" / f"fold{fold}"
-    return runs / f"{stem}_stage2_{ts}"
+        return runs / f"{ts}_stage2_cv" / f"fold{fold}"
+    return runs / f"{ts}_stage2"
 
 
 def train_stage2(args, device):

@@ -4,8 +4,8 @@
 # Usage:
 #   bash scripts/train_7tcdm3d.sh [<name>] [<mode>]
 #
-#   <name>  base run label; outputs go under runs/<name>*. Omit to auto-generate
-#           a timestamped name (runs/ldm_7tcdm3d_<ts>*).
+#   <name>  base run label; outputs go under runs/<name>*. Omit to identify the
+#           run purely by timestamp (runs/<ts>*) — no name needed.
 #   <mode>  one of:
 #     (omitted)  full k-fold CV: every fold trains BOTH stages on its 6/7 split
 #     cv2        train the AE ONCE (holdout), then k-fold CV on stage 2 only  [recommended]
@@ -29,9 +29,6 @@ RUN="${1:-}"
 MODE="${2:-}"
 N_FOLDS=7
 SEED=42
-# One timestamp per invocation, shared by all stage-2 folds so a k-fold run's
-# subfolders live under a single ``runs/<RUN>_stage2_<ts>_cv`` parent.
-S2TS="$(date +%Y-%m-%d_%H-%M-%S)"
 
 # If the 1st arg is actually a mode keyword and no 2nd arg was given, the user
 # omitted the run name — treat it as the mode and auto-name the run. Prevents
@@ -42,7 +39,7 @@ if [ -z "${MODE}" ]; then
         cv2|holdout) MODE="${RUN}"; RUN="" ;;
     esac
 fi
-RUN="${RUN:-ldm_7tcdm3d_$(date +%Y-%m-%d_%H-%M-%S)}"
+RUN="${RUN:-$(date +%Y-%m-%d_%H-%M-%S)}"
 
 # ── stage runners ─────────────────────────────────────────────────────────────
 # Extra args (the fold selection) are forwarded verbatim to whichever stage.
@@ -90,14 +87,14 @@ ensure_ae() {
 echo "Run name: ${RUN}   |   Mode: ${MODE:-full-cv}"
 
 # ── modes ─────────────────────────────────────────────────────────────────────
-# Layout: stage 1 (rarely retrained) lives in runs/<RUN>_stage1_ae; every stage-2
-# run gets its OWN timestamped folder. A k-fold stage-2 run nests all folds under
-# a single parent runs/<RUN>_stage2_<ts>_cv/fold{0..N}.
+# Layout: one run == one <RUN> id (a timestamp unless you named it). Stage 1
+# (rarely retrained) lives in runs/<RUN>_stage1_ae; stage 2 in its own sibling
+# runs/<RUN>_stage2*, with k-fold folds nested under runs/<RUN>_stage2_cv/fold*.
 if [ "${MODE}" = "holdout" ]; then
     # Single random val_frac=0.15 holdout (200/35), no k-fold anywhere.
     echo "Mode: holdout (no k-fold)"
     AE="$(ensure_ae)"
-    S2_DIR="runs/${RUN}_stage2_${S2TS}"
+    S2_DIR="runs/${RUN}_stage2"
     echo "========================================================================"
     echo " Stage 2 (holdout)  ->  ${S2_DIR}"
     echo "========================================================================"
@@ -111,7 +108,7 @@ elif [ "${MODE}" = "cv2" ]; then
     # folds reference the one shared AE and nest under a single _cv parent.
     echo "Mode: ${N_FOLDS}-fold CV on stage 2 (AE trained once / reused)"
     AE="$(ensure_ae)"
-    S2_PARENT="runs/${RUN}_stage2_${S2TS}_cv"
+    S2_PARENT="runs/${RUN}_stage2_cv"
     for FOLD in $(seq 0 $((N_FOLDS - 1))); do
         OUT="${S2_PARENT}/fold${FOLD}"
         echo "------------------------------------------------------------------------"
@@ -128,7 +125,7 @@ elif [ -n "${MODE}" ]; then
     # Single fold of the k-way split, both stages, nested under a _cv parent so
     # more folds can be added to the same run later and aggregated together.
     echo "Mode: single fold ${MODE} of ${N_FOLDS} (both stages)"
-    PARENT="runs/${RUN}_${S2TS}_cv"
+    PARENT="runs/${RUN}_cv"
     run_two_stage "${PARENT}/fold${MODE}" --n_folds ${N_FOLDS} --fold ${MODE}
     echo ""
     echo "Fold ${MODE} complete. Aggregate available folds with:"
@@ -136,9 +133,9 @@ elif [ -n "${MODE}" ]; then
 
 else
     # Full k-fold CV: every fold trains both stages on its own split, nested
-    # under one timestamped parent.
+    # under one parent.
     echo "Mode: ${N_FOLDS}-fold cross-validation (both stages)"
-    PARENT="runs/${RUN}_${S2TS}_cv"
+    PARENT="runs/${RUN}_cv"
     for FOLD in $(seq 0 $((N_FOLDS - 1))); do
         run_two_stage "${PARENT}/fold${FOLD}" --n_folds ${N_FOLDS} --fold ${FOLD}
     done
