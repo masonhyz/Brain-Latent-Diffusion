@@ -64,8 +64,11 @@ def get_args():
     p.set_defaults(augment=True)
     p.add_argument("--aug_flip_p",     type=float, default=0.5)
     p.add_argument("--aug_rotate_deg", type=float, default=10.0)
-    p.add_argument("--aug_noise_std",  type=float, default=0.1,
-                   help="Input-only Gaussian noise std; the target stays clean")
+    p.add_argument("--aug_noise_std",  type=float, default=0.0,
+                   help="Input-only Gaussian noise std; the target stays clean. "
+                        "Defaults to 0 here (the diffusion models use 0.1) because "
+                        "with --source pre the input is not only the conditioning, "
+                        "it is the ODE's starting point — see the warning in main().")
     # ── flow matching ────────────────────────────────────────────────────────
     p.add_argument("--source", type=str, default="pre", choices=["pre", "noise"],
                    help="Source distribution of the flow. 'pre' transports the "
@@ -213,6 +216,17 @@ def main():
         print(f"  ! --guidance_scale {args.guidance_scale} with --source pre: the "
               f"conditioning also seeds the trajectory, so CFG is not well defined "
               f"here. Use --source noise if you want guidance.")
+
+    if args.source == "pre" and args.augment and args.aug_noise_std > 0:
+        # For the diffusion models x_pre is only a conditioning signal, so noising
+        # it is a plain robustness augmentation. For the bridge it is also x(0),
+        # so training would learn to transport a *noisy* start to a clean target
+        # while sampling always starts from a clean one — the model picks up a
+        # denoising component it then applies to an image that was never noisy,
+        # over-smoothing exactly the residual we are trying to resolve.
+        print(f"  ! --aug_noise_std {args.aug_noise_std} with --source pre noises the "
+              f"ODE's starting point, not just the conditioning, which biases "
+              f"sampling (it starts from a clean x_pre). Use 0 unless testing this.")
 
     # ── data ─────────────────────────────────────────────────────────────────
     if args.augment:
