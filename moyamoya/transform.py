@@ -66,22 +66,17 @@ class PairedRandomFlip:
         return x, y
 
 
-class PairedRandomIntensityScale:
-    """
-    Independent per-volume random multiplicative scaling (applied after z-score).
-
-    Each volume gets its own scale factor drawn from Uniform(lo, hi), so the
-    model sees different relative intensity contrasts and becomes more robust
-    to inter-scanner / inter-session variability.
-    """
-
-    def __init__(self, scale_range: Tuple[float, float] = (0.9, 1.1)):
-        self.lo, self.hi = scale_range
-
-    def __call__(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        sx = random.uniform(self.lo, self.hi)
-        sy = random.uniform(self.lo, self.hi)
-        return x * sx, y * sy
+# NOTE ON INTENSITY AUGMENTATION
+# ------------------------------
+# Earlier revisions had per-volume intensity transforms (scale / shift / gamma)
+# that drew their parameters *independently* for x (pre) and y (post). For a
+# paired pre→post prediction task that is invalid: it perturbs the target by a
+# random amount the model cannot infer from the input, i.e. it injects label
+# noise and asks the model to hit a moving target. It is also largely redundant
+# here because ToChannelsFirstAndNormalize already z-scores each volume, which
+# normalises absolute scale/offset away. Those transforms were removed. The only
+# intensity-side augmentation kept is input-only Gaussian noise (see
+# PairedGaussianNoise), which leaves the target clean.
 
 
 class PairedRandomRotate3D:
@@ -132,65 +127,34 @@ class PairedRandomRotate3D:
         return self._apply(x, theta), self._apply(y, theta)
 
 
-class PairedRandomIntensityShift:
-    """
-    Independent per-volume additive intensity shift (applied after z-score).
-
-    Each volume gets its own offset drawn from Uniform(-max_shift, max_shift).
-    Like :class:`PairedRandomIntensityScale`, shifts are drawn *independently*
-    for x and y so the model sees varied absolute-intensity offsets.
-    """
-
-    def __init__(self, max_shift: float = 0.1):
-        self.max_shift = float(max_shift)
-
-    def __call__(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.max_shift <= 0:
-            return x, y
-        return (x + random.uniform(-self.max_shift, self.max_shift),
-                y + random.uniform(-self.max_shift, self.max_shift))
-
-
-class PairedRandomGamma:
-    """
-    Independent per-volume random gamma (contrast) adjustment.
-
-    Data is z-scored (zero-centred, signed), so a plain power would be undefined
-    for negatives. We apply a **sign-preserving** gamma, ``sign(v)*|v|**g``, which
-    is a smooth monotonic contrast warp valid on signed data. ``g`` is drawn from
-    Uniform(1-gamma, 1+gamma); g<1 boosts low-magnitude detail, g>1 suppresses it.
-    """
-
-    def __init__(self, gamma: float = 0.1):
-        self.gamma = float(gamma)
-
-    def _apply(self, v: torch.Tensor) -> torch.Tensor:
-        g = random.uniform(1.0 - self.gamma, 1.0 + self.gamma)
-        return v.sign() * v.abs().pow(g)
-
-    def __call__(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.gamma <= 0:
-            return x, y
-        return self._apply(x), self._apply(y)
-
-
 class PairedGaussianNoise:
     """
-    Additive Gaussian noise, drawn independently for x and y.
+    Additive Gaussian noise on the **input only** (default); the target is left
+    clean.
 
-    Acquisition noise is physically independent between the two scans, so the
-    noise fields are sampled independently (not shared). ``std`` is relative to
-    the z-scored data's unit standard deviation.
+    For a pre→post prediction task the target must stay pristine — corrupting it
+    teaches the model to reproduce a noise realisation it cannot see. Perturbing
+    only the input is the valid form: the model learns to map a noisy input to
+    the clean target, i.e. robustness to acquisition noise. ``std`` is relative
+    to the z-scored data's unit standard deviation.
+
+    ``input_only=False`` also noises the target (independent field) — kept only
+    for self-supervised use (e.g. an autoencoder reconstructing each volume to
+    itself, where there is no cross-volume target); do not use it for stage-2
+    paired prediction.
     """
 
-    def __init__(self, std: float = 0.1):
+    def __init__(self, std: float = 0.1, input_only: bool = True):
         self.std = float(std)
+        self.input_only = input_only
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.std <= 0:
             return x, y
-        return (x + torch.randn_like(x) * self.std,
-                y + torch.randn_like(y) * self.std)
+        x = x + torch.randn_like(x) * self.std
+        if not self.input_only:
+            y = y + torch.randn_like(y) * self.std
+        return x, y
 
 
 class PairedCompose:

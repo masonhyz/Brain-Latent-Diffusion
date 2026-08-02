@@ -14,9 +14,6 @@ from .transform import (
     PairedCompose,
     PairedRandomFlip,
     PairedRandomRotate3D,
-    PairedRandomIntensityScale,
-    PairedRandomIntensityShift,
-    PairedRandomGamma,
     PairedGaussianNoise,
 )
 
@@ -86,57 +83,55 @@ class AugmentedSubset(Dataset):
 
 # Default per-transform strengths. Each is "0 = disabled"; a strength of 0 makes
 # the corresponding transform a no-op, so a script can turn any single transform
-# off just by passing its flag as 0. These conservative defaults reproduce the
-# original augmentation (flip + intensity-scale only); the 7TCDM training script
-# opts into the richer suite (rotate/shift/gamma/noise) via its own CLI defaults.
+# off just by passing its flag as 0.
+#
+# The suite is deliberately restricted to transforms that are valid for a paired
+# pre→post prediction task: spatial transforms (flip, rotate) applied IDENTICALLY
+# to both volumes so voxel correspondence is preserved, plus input-only Gaussian
+# noise (target left clean). Independent intensity scale/shift/gamma were removed
+# — they perturb the target unpredictably (label noise) and are redundant given
+# per-volume z-scoring. See moyamoya/transform.py for the full rationale.
+#
+# These fallback defaults (flip only) apply to scripts that share build_loaders
+# but define no --aug_* flags (e.g. train_cdm3d.py); the 7TCDM training script
+# opts into rotate + noise via its own CLI defaults.
 AUG_DEFAULTS = {
-    "flip_p":          0.5,   # prob of left-right flip
-    "rotate_deg":      0.0,   # max |rotation| per axis, degrees
-    "intensity_scale": 0.1,   # multiplicative scale ∈ [1-s, 1+s]
-    "intensity_shift": 0.0,   # additive shift ∈ [-s, s]
-    "gamma":           0.0,   # gamma ∈ [1-g, 1+g] (sign-preserving)
-    "noise_std":       0.0,   # additive Gaussian noise std (z-scored units)
+    "flip_p":     0.5,   # prob of left-right flip (shared spatial)
+    "rotate_deg": 0.0,   # max |rotation| per axis, degrees (shared spatial)
+    "noise_std":  0.0,   # input-only Gaussian noise std (z-scored units)
 }
 
 
-def build_augmentation(flip_p=0.5, rotate_deg=0.0, intensity_scale=0.1,
-                       intensity_shift=0.0, gamma=0.0, noise_std=0.0):
+def build_augmentation(flip_p=0.5, rotate_deg=0.0, noise_std=0.0):
     """Assemble the paired train-time augmentation from per-transform strengths.
 
     Spatial transforms (flip, rotate) come first and are applied *identically* to
-    x and y; intensity transforms then noise follow (noise last so it isn't
-    rescaled). Any strength of 0 drops that transform, so an all-zero config
-    yields an empty (identity) pipeline.
+    x and y so their voxel correspondence is preserved; input-only Gaussian noise
+    comes last (target stays clean). Any strength of 0 drops that transform, so an
+    all-zero config yields an empty (identity) pipeline.
     """
     tfms = []
     if flip_p > 0:
         tfms.append(PairedRandomFlip(p=flip_p))
     if rotate_deg > 0:
         tfms.append(PairedRandomRotate3D(max_deg=rotate_deg))
-    if intensity_scale > 0:
-        tfms.append(PairedRandomIntensityScale(
-            scale_range=(1.0 - intensity_scale, 1.0 + intensity_scale)))
-    if intensity_shift > 0:
-        tfms.append(PairedRandomIntensityShift(max_shift=intensity_shift))
-    if gamma > 0:
-        tfms.append(PairedRandomGamma(gamma=gamma))
     if noise_std > 0:
-        tfms.append(PairedGaussianNoise(std=noise_std))
+        tfms.append(PairedGaussianNoise(std=noise_std, input_only=True))
     return PairedCompose(tfms)
 
 
 def build_augmentation_from_args(args):
     """Build the augmentation from ``--aug_*`` args, falling back to
     :data:`AUG_DEFAULTS` for any a script doesn't define (keeps the other models,
-    which never added these flags, on the original flip + intensity-scale suite)."""
+    which never added these flags, on the flip-only fallback)."""
     return build_augmentation(**{
         k: getattr(args, f"aug_{k}", v) for k, v in AUG_DEFAULTS.items()
     })
 
 
 def default_augmentation():
-    """Original minimal suite (flip + intensity-scale); kept for callers that
-    want it without an args object. See :func:`build_augmentation`."""
+    """Minimal valid suite (flip only); kept for callers that want it without an
+    args object. See :func:`build_augmentation`."""
     return build_augmentation()
 
 
