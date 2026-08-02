@@ -17,7 +17,9 @@ Usage:
 import argparse
 import csv
 import json
+import os
 import random
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -349,7 +351,106 @@ def get_args():
     p.add_argument("--cfg_drop_prob",   type=float, default=0.15)
     p.add_argument("--guidance_scale",  type=float, default=3.0)
     p.add_argument("--vis_every",       type=int,   default=5)
+    # Weights & Biases
+    p.add_argument("--wandb",    dest="wandb", action="store_true")
+    p.add_argument("--no-wandb", dest="wandb", action="store_false")
+    p.set_defaults(wandb=True)
+    p.add_argument("--wandb_project", type=str, default="moyamoya-7tcdm3d")
+    p.add_argument("--wandb_entity",  type=str, default=None)
+    p.add_argument("--wandb_group",   type=str, default=None,
+                   help="Group all runs (folds + AE) of one experiment; "
+                        "default: derived from out_dir by stripping _foldN/_ae")
+    p.add_argument("--wandb_mode",    type=str, default="online",
+                   choices=["online", "offline", "disabled"],
+                   help="online falls back to offline automatically if not logged in")
     return p.parse_args()
+
+
+# ── Weights & Biases ─────────────────────────────────────────────────────────
+# Robust by design: W&B must never block or crash a training run. If it's not
+# installed, or online mode is requested without credentials, we print a one-line
+# notice and training proceeds (falling back to offline logging where possible).
+
+def _has_wandb_creds() -> bool:
+    if os.environ.get("WANDB_API_KEY"):
+        return True
+    netrc = Path.home() / ".netrc"
+    try:
+        return netrc.is_file() and "api.wandb.ai" in netrc.read_text()
+    except Exception:
+        return False
+
+
+def init_wandb(args, out_dir: Path, stage: int, n_train: int, n_val: int):
+    """Start a W&B run for this (fold, stage), or return None if off/unavailable.
+
+    One run per (fold, stage); all runs of an experiment share ``group`` so the
+    k folds aggregate in the UI. ``job_type`` = stageN, and fold/stage land in
+    the config + tags for filtering.
+    """
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except Exception:
+        print("[wandb] not installed — skipping (`pip install wandb`). Training continues.")
+        return None
+
+    mode = args.wandb_mode
+    if mode == "online" and not _has_wandb_creds():
+        print("[wandb] online requested but not logged in → logging OFFLINE instead. "
+              "Run `wandb login` once (then `wandb sync <run dir>` to upload, or just "
+              "re-launch after login). Training continues.")
+        mode = "offline"
+
+    group = args.wandb_group or re.sub(r"_(fold\d+|ae)$", "", out_dir.name)
+    fold  = getattr(args, "fold", None)
+    config = dict(vars(args))
+    config.update(stage=stage, n_train=n_train, n_val=n_val,
+                  fold=fold, n_folds=getattr(args, "n_folds", None))
+    tags = [f"stage{stage}", "kfold" if fold is not None else "holdout"]
+    if fold is not None:
+        tags.append(f"fold{fold}")
+
+    try:
+        run = wandb.init(
+            project=args.wandb_project, entity=args.wandb_entity,
+            name=f"{out_dir.name}-stage{stage}", group=group,
+            job_type=f"stage{stage}", tags=tags, config=config,
+            dir=str(out_dir), mode=mode, reinit=True,
+        )
+        print(f"[wandb] project '{args.wandb_project}' | group '{group}' | "
+              f"run '{run.name}' | mode {mode}")
+        return run
+    except Exception as e:
+        print(f"[wandb] init failed ({e}); continuing without W&B.")
+        return None
+
+
+def _wandb_log(run, data: dict, step: int) -> None:
+    if run is not None:
+        try:
+            run.log(data, step=step)
+        except Exception:
+            pass
+
+
+def _wandb_log_image(run, key: str, path, step: int) -> None:
+    if run is None:
+        return
+    try:
+        import wandb
+        run.log({key: wandb.Image(str(path))}, step=step)
+    except Exception:
+        pass
+
+
+def _wandb_finish(run) -> None:
+    if run is not None:
+        try:
+            run.finish()
+        except Exception:
+            pass
 
 
 # ── data ─────────────────────────────────────────────────────────────────────
@@ -371,6 +472,7 @@ def train_stage1(args, device):
 
     train_dl, val_dl = make_loaders(args)
     save_hparams(args, len(train_dl.dataset), len(val_dl.dataset), out_dir)
+    run = init_wandb(args, out_dir, 1, len(train_dl.dataset), len(val_dl.dataset))
 
     ae = build_autoencoder(
         z_channels=args.z_channels,
@@ -424,6 +526,7 @@ def train_stage1(args, device):
         print(f"Epoch {epoch:4d}/{args.epochs}  train={tr_loss:.4f}  val={val_loss:.4f}")
         with open(csv_path, "a", newline="") as f:
             csv.writer(f).writerow([epoch, f"{tr_loss:.6f}", f"{val_loss:.6f}"])
+        _wandb_log(run, {"train_loss": tr_loss, "val_loss": val_loss}, step=epoch)
 
         ckpt = {"ae": ae.state_dict(), "args": vars(args)}
         torch.save(ckpt, out_dir / "stage1_last.pt")
@@ -443,6 +546,7 @@ def train_stage1(args, device):
 
     print(f"Stage 1 done. Best checkpoint: {out_dir / 'stage1_best.pt'}")
     plot_progression(out_dir, stage=1)
+    _wandb_finish(run)
     return out_dir / "stage1_best.pt"
 
 
@@ -464,6 +568,7 @@ def train_stage2(args, device):
 
     train_dl, val_dl = make_loaders(args)
     save_hparams(args, len(train_dl.dataset), len(val_dl.dataset), out_dir)
+    run = init_wandb(args, out_dir, 2, len(train_dl.dataset), len(val_dl.dataset))
 
     model = build_paired_latent_diffusion_7tcdm(
         z_channels=args.z_channels,
@@ -544,6 +649,7 @@ def train_stage2(args, device):
               f"PSNR={epoch_metrics['psnr']:.2f}  SSIM={epoch_metrics['ssim']:.4f}")
 
         _append_metrics_row(csv_path, epoch, tr_loss, val_loss, epoch_metrics)
+        _wandb_log(run, {"train_loss": tr_loss, "val_loss": val_loss, **epoch_metrics}, step=epoch)
 
         # AE is frozen in stage 2, so it is NOT duplicated into every stage-2
         # checkpoint; it lives once in stage1_best.pt and is referenced here.
@@ -583,9 +689,11 @@ def train_stage2(args, device):
                 vis_dir / f"epoch_{epoch:04d}.png",
             )
             print(f"  → saved visualisation: {vis_dir / f'epoch_{epoch:04d}.png'}")
+            _wandb_log_image(run, "val_sample", vis_dir / f"epoch_{epoch:04d}.png", step=epoch)
 
     print(f"Stage 2 done. Best checkpoint: {out_dir / 'stage2_best.pt'}")
     plot_progression(out_dir, stage=2)
+    _wandb_finish(run)
 
 
 # ── entry point ───────────────────────────────────────────────────────────────

@@ -47,13 +47,13 @@ run_stage1() {           # run_stage1 <out_dir> [extra args...]
     local OUT="$1"; shift
     python scripts/train_ldm_7tcdm3d.py \
         --stage 1 --out_dir "${OUT}" --data_root fmri --epochs 200 \
-        --seed ${SEED} "$@"
+        --wandb_group "${RUN}" --seed ${SEED} "$@"
 }
 run_stage2() {           # run_stage2 <out_dir> <ae_ckpt> [extra args...]
     local OUT="$1"; local AE="$2"; shift 2
     python scripts/train_ldm_7tcdm3d.py \
         --stage 2 --ae_ckpt "${AE}" --out_dir "${OUT}" --data_root fmri --epochs 2000 \
-        --seed ${SEED} "$@"
+        --wandb_group "${RUN}" --seed ${SEED} "$@"
 }
 run_two_stage() {        # run_two_stage <out_dir> [extra args...]  (AE from same dir)
     local OUT="$1"; shift
