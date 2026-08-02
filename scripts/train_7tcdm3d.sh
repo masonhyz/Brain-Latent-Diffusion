@@ -1,32 +1,48 @@
 #!/bin/bash
 # Train the 7TCDM-3D latent diffusion model (KL-autoencoder then latent denoiser).
 #
-# The 2nd arg selects the mode:
-#   (omitted)  -> full k-fold CV: every fold trains BOTH stages on its 6/7 split
-#   <int>      -> only that fold, both stages (resume a crash / one GPU per fold)
-#   holdout    -> the original single 15% holdout (200/35), NO k-fold
-#   cv2        -> train the AE ONCE (holdout), then k-fold CV on stage 2 only
+# Usage:
+#   bash scripts/train_7tcdm3d.sh [<name>] [<mode>]
 #
-# `cv2` is the recommended default: the AE shows no train/val generalization gap
-# (val recon loss ~= train), so reusing one frozen AE across the stage-2 folds
-# adds negligible leakage while skipping 6 redundant AE trainings. The thing we
-# actually cross-validate — post-surgery prediction — is the stage-2 denoiser.
+#   <name>  base run label; outputs go under runs/<name>*. Omit to auto-generate
+#           a timestamped name (runs/ldm_7tcdm3d_<ts>*).
+#   <mode>  one of:
+#     (omitted)  full k-fold CV: every fold trains BOTH stages on its 6/7 split
+#     cv2        train the AE ONCE (holdout), then k-fold CV on stage 2 only  [recommended]
+#     <int>      only that fold, both stages (resume a crash / one GPU per fold)
+#     holdout    the original single 15% holdout (200/35), NO k-fold
 #
-# Run from the project root:
-#   bash scripts/train_7tcdm3d.sh my_experiment          # full CV, both stages
+#   A bare mode keyword works too: `bash scripts/train_7tcdm3d.sh cv2` auto-names
+#   the run (so it does NOT become a run literally named "cv2").
+#
+# Reuse an existing AE for cv2 (skip stage 1 entirely) via the AE_CKPT env var:
+#   AE_CKPT=runs/foo/stage1_best.pt bash scripts/train_7tcdm3d.sh myexp cv2
+#
+# Examples:
 #   bash scripts/train_7tcdm3d.sh my_experiment cv2      # AE once + CV stage 2
+#   bash scripts/train_7tcdm3d.sh my_experiment          # full CV, both stages
 #   bash scripts/train_7tcdm3d.sh my_experiment 3        # only fold 3, both stages
 #   bash scripts/train_7tcdm3d.sh my_experiment holdout  # legacy single holdout
 set -e
 
-RUN="${1:-ldm_7tcdm3d_$(date +%Y-%m-%d_%H-%M-%S)}"
-MODE="$2"
+RUN="${1:-}"
+MODE="${2:-}"
 N_FOLDS=7
 SEED=42
 
+# If the 1st arg is actually a mode keyword and no 2nd arg was given, the user
+# omitted the run name — treat it as the mode and auto-name the run. Prevents
+# `bash train_7tcdm3d.sh cv2` from silently becoming a run *named* "cv2" in the
+# default (full-CV) mode.
+if [ -z "${MODE}" ]; then
+    case "${RUN}" in
+        cv2|holdout) MODE="${RUN}"; RUN="" ;;
+    esac
+fi
+RUN="${RUN:-ldm_7tcdm3d_$(date +%Y-%m-%d_%H-%M-%S)}"
+
 # ── stage runners ─────────────────────────────────────────────────────────────
-# Extra args (the fold selection) are forwarded verbatim, so a fold applies to
-# whichever stage(s) you point it at.
+# Extra args (the fold selection) are forwarded verbatim to whichever stage.
 run_stage1() {           # run_stage1 <out_dir> [extra args...]
     local OUT="$1"; shift
     python scripts/train_ldm_7tcdm3d.py \
@@ -49,6 +65,8 @@ run_two_stage() {        # run_two_stage <out_dir> [extra args...]  (AE from sam
     echo "Done. Best checkpoint: ${OUT}/stage2_best.pt"
 }
 
+echo "Run name: ${RUN}   |   Mode: ${MODE:-full-cv}"
+
 # ── modes ─────────────────────────────────────────────────────────────────────
 if [ "${MODE}" = "holdout" ]; then
     # Legacy: single random val_frac=0.15 holdout (200/35), no k-fold anywhere.
@@ -59,21 +77,30 @@ if [ "${MODE}" = "holdout" ]; then
     echo "  python scripts/eval_ldm_7tcdm3d.py --ckpt runs/${RUN}/stage2_best.pt --val_only"
 
 elif [ "${MODE}" = "cv2" ]; then
-    # Train the AE once on a holdout split, then CV only stage 2. All stage-2
+    # Train the AE once (or reuse AE_CKPT), then CV only stage 2. All stage-2
     # folds reference the one shared AE; the _ae dir is not a _fold* dir, so the
     # aggregator ignores it.
-    AE_DIR="runs/${RUN}_ae"
-    echo "Mode: AE trained once (${AE_DIR}) + ${N_FOLDS}-fold CV on stage 2 only"
-    echo "========================================================================"
-    echo " Stage 1 (shared AE)  ->  ${AE_DIR}"
-    echo "========================================================================"
-    run_stage1 "${AE_DIR}"                       # no --fold => holdout AE
+    if [ -n "${AE_CKPT}" ]; then
+        AE="${AE_CKPT}"
+        if [ ! -f "${AE}" ]; then
+            echo "ERROR: AE_CKPT not found: ${AE}" >&2; exit 1
+        fi
+        echo "Mode: ${N_FOLDS}-fold CV on stage 2, reusing AE: ${AE} (stage 1 skipped)"
+    else
+        AE_DIR="runs/${RUN}_ae"
+        echo "Mode: AE trained once (${AE_DIR}) + ${N_FOLDS}-fold CV on stage 2"
+        echo "========================================================================"
+        echo " Stage 1 (shared AE)  ->  ${AE_DIR}"
+        echo "========================================================================"
+        run_stage1 "${AE_DIR}"                       # no --fold => holdout AE
+        AE="${AE_DIR}/stage1_best.pt"
+    fi
     for FOLD in $(seq 0 $((N_FOLDS - 1))); do
         OUT="runs/${RUN}_fold${FOLD}"
         echo "------------------------------------------------------------------------"
         echo " Stage 2, fold ${FOLD}/${N_FOLDS}  ->  ${OUT}"
         echo "------------------------------------------------------------------------"
-        run_stage2 "${OUT}" "${AE_DIR}/stage1_best.pt" --n_folds ${N_FOLDS} --fold ${FOLD}
+        run_stage2 "${OUT}" "${AE}" --n_folds ${N_FOLDS} --fold ${FOLD}
         echo "Fold ${FOLD} done. Best checkpoint: ${OUT}/stage2_best.pt"
     done
     echo ""
