@@ -320,6 +320,13 @@ def get_args():
     p.add_argument("--amp",    dest="amp", action="store_true")
     p.add_argument("--no-amp", dest="amp", action="store_false")
     p.set_defaults(amp=True)
+    # stage-1 early stopping: after a warmup of --es_min_epochs, stop once val
+    # loss has failed to beat the running best for --es_patience epochs in a row.
+    p.add_argument("--es_min_epochs", type=int, default=50,
+                   help="Stage-1 early stopping: never stop before this epoch")
+    p.add_argument("--es_patience",   type=int, default=10,
+                   help="Stage-1 early stopping: stop after this many consecutive "
+                        "epochs with no val-loss improvement")
     # autoencoder architecture
     p.add_argument("--z_channels",    type=int,   default=4)
     p.add_argument("--embed_dim",     type=int,   default=4)
@@ -386,6 +393,7 @@ def train_stage1(args, device):
         csv.writer(f).writerow(["epoch", "train_loss", "val_loss"])
 
     best_val = float("inf")
+    epochs_no_improve = 0
 
     for epoch in range(1, args.epochs + 1):
         ae.train()
@@ -421,8 +429,17 @@ def train_stage1(args, device):
         torch.save(ckpt, out_dir / "stage1_last.pt")
         if val_loss < best_val:
             best_val = val_loss
+            epochs_no_improve = 0
             torch.save(ckpt, out_dir / "stage1_best.pt")
             print(f"  → new best AE ({best_val:.4f})")
+        else:
+            epochs_no_improve += 1
+            # Only arm early stopping after a warmup; the AE is cheap and
+            # converges fast, so there's no need to burn the full schedule.
+            if epoch > args.es_min_epochs and epochs_no_improve >= args.es_patience:
+                print(f"  → early stop at epoch {epoch}: no val-loss improvement "
+                      f"for {epochs_no_improve} epochs (best={best_val:.4f})")
+                break
 
     print(f"Stage 1 done. Best checkpoint: {out_dir / 'stage1_best.pt'}")
     plot_progression(out_dir, stage=1)
