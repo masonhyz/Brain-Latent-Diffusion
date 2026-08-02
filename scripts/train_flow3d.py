@@ -150,7 +150,9 @@ def get_args():
     p.add_argument("--metric_every", type=int, default=5,
                    help="Run full sampling + MAE/MSE/PSNR/SSIM every N epochs. "
                         "val_loss is logged every epoch regardless.")
-    p.add_argument("--vis_every",    type=int, default=25)
+    p.add_argument("--vis_every",    type=int, default=5,
+                   help="Save a val prediction grid every N epochs (matches the "
+                        "7TCDM-3D cadence). Sampling here is cheap (~16 NFE).")
     # ── W&B ──────────────────────────────────────────────────────────────────
     p.add_argument("--wandb",    dest="wandb", action="store_true")
     p.add_argument("--no-wandb", dest="wandb", action="store_false")
@@ -392,6 +394,16 @@ def main():
         log = {"train_loss": tr_loss, "val_loss": val_loss, "lr": lr}
         if do_metrics:
             log.update(m)
+            # Overlay the identity baseline as a constant and log the signed
+            # improvement (positive = better than copying x_pre) so the W&B
+            # charts show progress against the number that actually matters,
+            # not just an absolute metric that could still be losing.
+            for k, hib in METRIC_HIGHER_BETTER.items():
+                log[f"identity/{k}"] = baseline[k]
+                log[f"improvement/{k}"] = (m[k] - baseline[k]) if hib else (baseline[k] - m[k])
+            log["beats_identity_count"] = sum(
+                1 for k, hib in METRIC_HIGHER_BETTER.items()
+                if ((m[k] > baseline[k]) if hib else (m[k] < baseline[k])))
         wandb_log(run, log, step=epoch)
 
         ckpt = checkpoint()
