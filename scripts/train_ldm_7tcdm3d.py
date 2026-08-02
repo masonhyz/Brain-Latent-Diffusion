@@ -267,6 +267,8 @@ def save_hparams(args, n_train: int, n_val: int, out_dir: Path) -> None:
             "n_val": n_val,
             "val_frac": args.val_frac,
             "seed": args.seed,
+            "n_folds": args.n_folds,
+            "fold": args.fold,
         },
     }
     path = out_dir / f"hparams_stage{args.stage}.json"
@@ -299,9 +301,17 @@ def get_args():
     p.add_argument("--data_root",   type=str,   default="fmri")
     p.add_argument("--out_dir",     type=str,   default=None)
     # data
-    p.add_argument("--val_frac",    type=float, default=0.15)
+    p.add_argument("--val_frac",    type=float, default=0.15,
+                   help="Holdout validation fraction (ignored when --fold is set)")
     p.add_argument("--num_workers", type=int,   default=4)
     p.add_argument("--seed",        type=int,   default=42)
+    # k-fold cross-validation: pass --fold to hold out one of --n_folds disjoint
+    # folds instead of a --val_frac holdout. Stage 2 must use the SAME seed +
+    # n_folds + fold as its stage-1 AE so both stages share the held-out subjects.
+    p.add_argument("--n_folds",     type=int,   default=7,
+                   help="Number of CV folds (used only when --fold is set)")
+    p.add_argument("--fold",        type=int,   default=None,
+                   help="Held-out fold index 0..n_folds-1. Unset = --val_frac holdout.")
     # training
     p.add_argument("--epochs",      type=int,   default=None,
                    help="Override epochs (default: 200 for stage 1, 2000 for stage 2)")

@@ -232,9 +232,16 @@ def main():
     elif args.val_only:
         val_frac = args.val_frac or ckpt_args.get("val_frac", 0.15)
         seed     = args.seed     or ckpt_args.get("seed",     42)
-        _, dataset = reconstruct_val_split(ds, val_frac, seed)
+        # Reconstruct the same fold this checkpoint trained against. Old (pre
+        # k-fold) checkpoints have no "fold" key, so .get() → None → holdout.
+        n_folds  = ckpt_args.get("n_folds")
+        fold     = ckpt_args.get("fold")
+        _, dataset = reconstruct_val_split(ds, val_frac, seed, n_folds=n_folds, fold=fold)
         indices = range(len(dataset))
-        print(f"Val-only mode: {len(dataset)} val samples (val_frac={val_frac}, seed={seed})")
+        if fold is not None:
+            print(f"Val-only mode: {len(dataset)} val samples (fold {fold}/{n_folds}, seed={seed})")
+        else:
+            print(f"Val-only mode: {len(dataset)} val samples (val_frac={val_frac}, seed={seed})")
     else:
         dataset, indices = ds, range(len(ds))
 

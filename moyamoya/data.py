@@ -6,7 +6,7 @@ provably use the *same* held-out validation subjects.
 """
 
 import torch
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from .dataset import PrePostFMRI
 from .transform import (
@@ -17,12 +17,49 @@ from .transform import (
 )
 
 
-def reconstruct_val_split(ds, val_frac: float, seed: int):
-    """Deterministic (train_subset, val_subset) split.
+def kfold_split(ds, n_folds: int, fold: int, seed: int):
+    """Deterministic k-fold ``(train_subset, val_subset)`` for one fold.
 
-    Identical formula to every train/eval script, so a checkpoint's validation
-    subjects can be reproduced exactly at eval time from (val_frac, seed).
+    A single seeded permutation of all sample indices is partitioned into
+    ``n_folds`` disjoint, near-equal contiguous chunks (uneven sizes handled like
+    ``np.array_split``: the first ``len(ds) % n_folds`` chunks get one extra).
+    Fold ``fold`` is the held-out validation chunk; the remaining chunks are the
+    training set.
+
+    The permutation depends only on ``(seed, n_folds)`` — *not* on ``fold`` — so
+    across ``fold = 0..n_folds-1`` the validation chunks are mutually disjoint and
+    cover every subject exactly once, and any ``(seed, n_folds, fold)`` reproduces
+    the identical split at eval time.
     """
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be >= 2, got {n_folds}")
+    if not (0 <= fold < n_folds):
+        raise ValueError(f"fold must be in [0, {n_folds}), got {fold}")
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(ds), generator=g)
+    chunks = torch.tensor_split(perm, n_folds)
+    val_idx = chunks[fold].tolist()
+    train_idx = [int(i) for j, c in enumerate(chunks) if j != fold for i in c.tolist()]
+    return Subset(ds, train_idx), Subset(ds, [int(i) for i in val_idx])
+
+
+def reconstruct_val_split(ds, val_frac: float, seed: int, n_folds=None, fold=None):
+    """Deterministic ``(train_subset, val_subset)`` split.
+
+    Two modes, both pure functions of their arguments so a checkpoint's
+    validation subjects reproduce exactly at eval time:
+
+      * **k-fold** — when ``fold`` is not None: hold out fold ``fold`` of
+        ``n_folds`` (see :func:`kfold_split`). ``val_frac`` is ignored.
+      * **holdout** — otherwise: hold out a random ``val_frac`` fraction. This is
+        the legacy single-split behaviour, kept for backward compatibility so old
+        checkpoints (and the other models that share this helper) reconstruct the
+        same subjects they always did.
+    """
+    if fold is not None:
+        if n_folds is None:
+            raise ValueError("n_folds is required when fold is set")
+        return kfold_split(ds, n_folds, fold, seed)
     n_val = max(1, int(len(ds) * val_frac))
     n_train = len(ds) - n_val
     g = torch.Generator().manual_seed(seed)
@@ -56,7 +93,13 @@ def build_loaders(args, augment: bool = False):
     tfm = ToChannelsFirstAndNormalize(nonzero_mask=True)
     ds  = PrePostFMRI(root_dir=args.data_root, transform=tfm, strict=False)
 
-    train_subset, val_subset = reconstruct_val_split(ds, args.val_frac, args.seed)
+    # ``getattr`` defaults keep the other models (which never define these args)
+    # on the legacy holdout path; only the 7TCDM pipeline sets --fold.
+    train_subset, val_subset = reconstruct_val_split(
+        ds, args.val_frac, args.seed,
+        n_folds=getattr(args, "n_folds", None),
+        fold=getattr(args, "fold", None),
+    )
     train_ds = AugmentedSubset(train_subset, default_augmentation()) if augment else train_subset
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
