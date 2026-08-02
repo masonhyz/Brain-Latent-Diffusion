@@ -157,7 +157,9 @@ def get_args():
     p.add_argument("--wandb",    dest="wandb", action="store_true")
     p.add_argument("--no-wandb", dest="wandb", action="store_false")
     p.set_defaults(wandb=True)
-    p.add_argument("--wandb_project", type=str, default="moyamoya-flow3d")
+    p.add_argument("--wandb_project", type=str, default="moyamoya-7tcdm3d",
+                   help="Shares the existing 7TCDM-3D project for now; flow3d runs "
+                        "are distinguished by --wandb_group (e.g. flow3d_bridge).")
     p.add_argument("--wandb_entity",  type=str, default=None)
     p.add_argument("--wandb_group",   type=str, default=None)
     p.add_argument("--wandb_mode",    type=str, default="online",
