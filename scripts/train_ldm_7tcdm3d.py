@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from moyamoya.data import build_loaders
-from moyamoya.utils import seed_everything, get_device
+from moyamoya.utils import seed_everything, resolve_seed, get_device
 from moyamoya.metrics import compute_metrics
 from moyamoya.models.ldm_7tcdm3d import build_paired_latent_diffusion_7tcdm
 from moyamoya.models.ldm3d import build_autoencoder
@@ -317,7 +317,11 @@ def get_args():
     p.add_argument("--val_frac",    type=float, default=0.15,
                    help="Holdout validation fraction (ignored when --fold is set)")
     p.add_argument("--num_workers", type=int,   default=4)
-    p.add_argument("--seed",        type=int,   default=42)
+    p.add_argument("--seed",        type=int,   default=None,
+                   help="RNG seed for the train/val split + init. Default: draw a "
+                        "random seed and log it to hparams/checkpoint (pass "
+                        "--seed <n> to reproduce a past run). Stage 2 inherits its "
+                        "AE checkpoint's seed when this is unset.")
     # k-fold cross-validation: pass --fold to hold out one of --n_folds disjoint
     # folds instead of a --val_frac holdout. Stage 2 must use the SAME seed +
     # n_folds + fold as its stage-1 AE so both stages share the held-out subjects.
@@ -784,7 +788,21 @@ def main():
     args = get_args()
     if args.epochs is None:
         args.epochs = 200 if args.stage == 1 else 1000
+
+    # Resolve the RNG seed before anything samples from it. With no --seed we draw
+    # a fresh random seed (logged to hparams + checkpoint below) instead of always
+    # reusing a constant. Stage 2 is special: it must reuse its AE's train/val
+    # split so both stages hold out the SAME subjects, so it inherits the stage-1
+    # seed from the AE checkpoint unless --seed is given explicitly.
+    if args.seed is None and args.stage == 2 and args.ae_ckpt:
+        ae_args = torch.load(args.ae_ckpt, map_location="cpu").get("args") or {}
+        inherited = ae_args.get("seed")
+        if inherited is not None:
+            args.seed = inherited
+            print(f"[Stage 2] inheriting split seed {inherited} from {args.ae_ckpt}")
+    args.seed = resolve_seed(args.seed)
     seed_everything(args.seed)
+    print(f"Seed: {args.seed}  (rerun with --seed {args.seed} to reproduce this run)")
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True

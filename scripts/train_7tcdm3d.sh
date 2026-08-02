@@ -18,6 +18,10 @@
 # Reuse an existing AE for cv2 (skip stage 1 entirely) via the AE_CKPT env var:
 #   AE_CKPT=runs/foo/stage1_best.pt bash scripts/train_7tcdm3d.sh myexp cv2
 #
+# By default a fresh random seed is drawn for the whole sweep and echoed below.
+# Pin it to reproduce a past sweep exactly via the SEED env var:
+#   SEED=12345 bash scripts/train_7tcdm3d.sh myexp cv2
+#
 # Examples:
 #   bash scripts/train_7tcdm3d.sh my_experiment cv2      # AE once + CV stage 2
 #   bash scripts/train_7tcdm3d.sh my_experiment          # full CV, both stages
@@ -28,7 +32,12 @@ set -e
 RUN="${1:-}"
 MODE="${2:-}"
 N_FOLDS=7
-SEED=42
+# One RNG seed for the WHOLE sweep. Every fold MUST share it: kfold_split derives
+# the split from (seed, n_folds) alone — not from the fold index — so the k
+# held-out chunks form a true partition (each subject validated exactly once) only
+# when all folds use the same seed. Draw a fresh random seed unless the caller
+# pins one via `SEED=<n> bash ...`; it's echoed below so the sweep reproduces.
+SEED="${SEED:-$(python -c 'import random; print(random.SystemRandom().randint(1, 2**32 - 1))')}"
 
 # If the 1st arg is actually a mode keyword and no 2nd arg was given, the user
 # omitted the run name — treat it as the mode and auto-name the run. Prevents
@@ -40,6 +49,7 @@ if [ -z "${MODE}" ]; then
     esac
 fi
 RUN="${RUN:-$(date +%Y-%m-%d_%H-%M-%S)}"
+echo "Seed: ${SEED}  (rerun with SEED=${SEED} to reproduce this sweep)"
 
 # ── stage runners ─────────────────────────────────────────────────────────────
 # Extra args (the fold selection) are forwarded verbatim to whichever stage.

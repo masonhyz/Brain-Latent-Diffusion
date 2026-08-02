@@ -12,6 +12,23 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def resolve_seed(seed: int | None = None) -> int:
+    """Return a concrete RNG seed, drawing a random one when ``seed`` is None.
+
+    Passing None picks a fresh seed each run from the OS entropy source instead
+    of pinning every run to the same constant. The caller MUST log the returned
+    value for reproducibility — the training scripts save it into hparams + the
+    checkpoint, so a run can be recreated exactly by rerunning with
+    ``--seed <logged value>`` (same train/val split and initialization).
+
+    The seed stays in ``[1, 2**32 - 1]``: below numpy's 2**32 ceiling and never
+    0, so it survives ``args.seed or <default>`` fallbacks elsewhere.
+    """
+    if seed is None:
+        seed = random.SystemRandom().randint(1, 2**32 - 1)
+    return int(seed)
+
+
 def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
