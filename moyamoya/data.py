@@ -13,7 +13,8 @@ from .transform import (
     ToChannelsFirstAndNormalize,
     PairedCompose,
     PairedRandomFlip,
-    PairedRandomIntensityScale,
+    PairedRandomRotate3D,
+    PairedGaussianNoise,
 )
 
 
@@ -80,16 +81,65 @@ class AugmentedSubset(Dataset):
         return self.aug(x, y)
 
 
+# Default per-transform strengths. Each is "0 = disabled"; a strength of 0 makes
+# the corresponding transform a no-op, so a script can turn any single transform
+# off just by passing its flag as 0.
+#
+# The suite is deliberately restricted to transforms that are valid for a paired
+# pre→post prediction task: spatial transforms (flip, rotate) applied IDENTICALLY
+# to both volumes so voxel correspondence is preserved, plus input-only Gaussian
+# noise (target left clean). Independent intensity scale/shift/gamma were removed
+# — they perturb the target unpredictably (label noise) and are redundant given
+# per-volume z-scoring. See moyamoya/transform.py for the full rationale.
+#
+# These fallback defaults (flip only) apply to scripts that share build_loaders
+# but define no --aug_* flags (e.g. train_cdm3d.py); the 7TCDM training script
+# opts into rotate + noise via its own CLI defaults.
+AUG_DEFAULTS = {
+    "flip_p":     0.5,   # prob of left-right flip (shared spatial)
+    "rotate_deg": 0.0,   # max |rotation| per axis, degrees (shared spatial)
+    "noise_std":  0.0,   # input-only Gaussian noise std (z-scored units)
+}
+
+
+def build_augmentation(flip_p=0.5, rotate_deg=0.0, noise_std=0.0):
+    """Assemble the paired train-time augmentation from per-transform strengths.
+
+    Spatial transforms (flip, rotate) come first and are applied *identically* to
+    x and y so their voxel correspondence is preserved; input-only Gaussian noise
+    comes last (target stays clean). Any strength of 0 drops that transform, so an
+    all-zero config yields an empty (identity) pipeline.
+    """
+    tfms = []
+    if flip_p > 0:
+        tfms.append(PairedRandomFlip(p=flip_p))
+    if rotate_deg > 0:
+        tfms.append(PairedRandomRotate3D(max_deg=rotate_deg))
+    if noise_std > 0:
+        tfms.append(PairedGaussianNoise(std=noise_std, input_only=True))
+    return PairedCompose(tfms)
+
+
+def build_augmentation_from_args(args):
+    """Build the augmentation from ``--aug_*`` args, falling back to
+    :data:`AUG_DEFAULTS` for any a script doesn't define (keeps the other models,
+    which never added these flags, on the flip-only fallback)."""
+    return build_augmentation(**{
+        k: getattr(args, f"aug_{k}", v) for k, v in AUG_DEFAULTS.items()
+    })
+
+
 def default_augmentation():
-    return PairedCompose([
-        PairedRandomFlip(p=0.5),
-        PairedRandomIntensityScale(scale_range=(0.9, 1.1)),
-    ])
+    """Minimal valid suite (flip only); kept for callers that want it without an
+    args object. See :func:`build_augmentation`."""
+    return build_augmentation()
 
 
 def build_loaders(args, augment: bool = False):
     """Build (train_dl, val_dl) from ``args`` (data_root, val_frac, seed,
-    batch_size, num_workers). ``augment`` adds flip + intensity-scale to train."""
+    batch_size, num_workers). When ``augment`` is set, the train split is wrapped
+    with the paired augmentation built from ``--aug_*`` args (see
+    :func:`build_augmentation_from_args`)."""
     tfm = ToChannelsFirstAndNormalize(nonzero_mask=True)
     ds  = PrePostFMRI(root_dir=args.data_root, transform=tfm, strict=False)
 
@@ -100,7 +150,8 @@ def build_loaders(args, augment: bool = False):
         n_folds=getattr(args, "n_folds", None),
         fold=getattr(args, "fold", None),
     )
-    train_ds = AugmentedSubset(train_subset, default_augmentation()) if augment else train_subset
+    train_ds = (AugmentedSubset(train_subset, build_augmentation_from_args(args))
+                if augment else train_subset)
 
     # persistent_workers avoids re-spawning workers every epoch (a real cost with
     # small datasets + many epochs); only valid when num_workers > 0. Defaults to
