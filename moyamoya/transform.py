@@ -15,9 +15,18 @@ class ToChannelsFirstAndNormalize:
     Normalization: z-score per-sample (optionally within nonzero mask).
     """
 
-    def __init__(self, eps: float = 1e-6, nonzero_mask: bool = True):
+    def __init__(self, eps: float = 1e-6, nonzero_mask: bool = True,
+                 zero_background: bool = False):
+        """
+        Args:
+            nonzero_mask: compute the z-score statistics over nonzero voxels only.
+            zero_background: restore exact zeros outside the acquired volume after
+                normalising. **Off by default, and that default is a trap** —
+                see :meth:`_zscore`.
+        """
         self.eps = eps
         self.nonzero_mask = nonzero_mask
+        self.zero_background = zero_background
 
     def _reorder(self, t: torch.Tensor) -> torch.Tensor:
         if t.ndim == 3:
@@ -32,12 +41,31 @@ class ToChannelsFirstAndNormalize:
             raise ValueError(f"Expected 3D or 4D tensor, got shape {tuple(t.shape)}")
 
     def _zscore(self, t: torch.Tensor) -> torch.Tensor:
-        # Stats over nonzero voxels when masking (falling back to global if the
-        # volume is all-zero); over the whole volume otherwise.
+        """Per-volume z-score.
+
+        ``zero_background`` decides whether the background survives as zeros.
+
+        With it OFF (the historical default), the shift ``t - mean`` is applied
+        to the *whole* tensor, so background voxels — exactly 0 on input — come
+        out at ``-mean/std ≈ -2.4``, i.e. **nonzero**. Every downstream
+        ``(x != 0)`` "brain mask" in this project therefore selects 100 % of the
+        volume rather than the ~29 % that is brain, and every metric documented
+        as brain-masked is in fact whole-volume. The difference is not cosmetic:
+        on the seed=42 val split the identity baseline scores MAE 0.2231 /
+        SSIM 0.8382 whole-volume but MAE 0.4687 / SSIM 0.5176 on brain tissue —
+        roughly 71 % of each metric was measuring how well a constant background
+        is reproduced.
+
+        The default stays OFF so the diffusion models and their checkpoints keep
+        behaving exactly as they always did. Flow3D turns it ON.
+        """
         mask = (t != 0) if self.nonzero_mask else torch.ones_like(t, dtype=torch.bool)
         vals = t[mask] if mask.any() else t
         std = vals.std(unbiased=False).clamp_min(self.eps)
-        return (t - vals.mean()) / std
+        out = (t - vals.mean()) / std
+        if self.zero_background and self.nonzero_mask and mask.any():
+            out = out * mask
+        return out
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self._reorder(x)

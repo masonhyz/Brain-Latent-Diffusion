@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from moyamoya.data import reconstruct_val_split
 from moyamoya.dataset import PrePostFMRI
-from moyamoya.metrics import compute_metrics
+from moyamoya.metrics import compute_metrics, tissue_mask
 from moyamoya.models.flow3d import load_flow3d_checkpoint
 from moyamoya.runlog import save_grid
 from moyamoya.transform import ToChannelsFirstAndNormalize
@@ -156,9 +156,15 @@ def main():
           f"n_samples={args.n_samples}")
 
     # ── dataset / split ──────────────────────────────────────────────────────
+    # Preprocessing must match what the checkpoint was trained with, or the
+    # background alone shifts every metric by ~2x on MAE.
+    zero_bg = ck.get("zero_background", False)
+    print(f"  preprocessing: zero_background={zero_bg} "
+          f"({'brain-only' if zero_bg else 'whole-volume'} metrics)")
     ds = PrePostFMRI(root_dir=args.data_root, pre_dirname=args.pre_dirname,
                      post_dirname=args.post_dirname,
-                     transform=ToChannelsFirstAndNormalize(nonzero_mask=True),
+                     transform=ToChannelsFirstAndNormalize(nonzero_mask=True,
+                                                           zero_background=zero_bg),
                      strict=False, return_paths=True)
 
     if args.subject:
@@ -196,7 +202,7 @@ def main():
                 x, y, meta = ds[i]
                 xb = x.unsqueeze(0).to(device)
                 pred = predict(model, xb, args, s, subject_seed(args.sample_seed, meta["id"]))
-                mm = compute_metrics(pred[0].float().cpu(), y, (x != 0) | (y != 0))
+                mm = compute_metrics(pred[0].float().cpu(), y, tissue_mask(x, y))
                 for m in METRICS:
                     acc[m].append(mm[m])
             means = {m: float(np.mean(v)) for m, v in acc.items()}
@@ -220,7 +226,7 @@ def main():
         pred = predict(model, xb, args, steps, subject_seed(args.sample_seed, sid))
         pred_c = pred[0].float().cpu()
 
-        mask = (x != 0) | (y != 0)
+        mask = tissue_mask(x, y)
         mm = compute_metrics(pred_c, y, mask)
         # The same volume scored against the trivial predictor, subject by
         # subject — so per-subject wins and losses are both visible, not just

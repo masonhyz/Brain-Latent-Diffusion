@@ -140,7 +140,14 @@ def build_loaders(args, augment: bool = False):
     batch_size, num_workers). When ``augment`` is set, the train split is wrapped
     with the paired augmentation built from ``--aug_*`` args (see
     :func:`build_augmentation_from_args`)."""
-    tfm = ToChannelsFirstAndNormalize(nonzero_mask=True)
+    # zero_background defaults off so the diffusion models keep their historical
+    # preprocessing; only scripts that define the flag (Flow3D) opt in. See
+    # ToChannelsFirstAndNormalize._zscore for why it matters — with it off, every
+    # "(x != 0)" brain mask downstream actually selects the whole volume.
+    tfm = ToChannelsFirstAndNormalize(
+        nonzero_mask=True,
+        zero_background=getattr(args, "zero_background", False),
+    )
     ds  = PrePostFMRI(root_dir=args.data_root, transform=tfm, strict=False)
 
     # ``getattr`` defaults keep the other models (which never define these args)

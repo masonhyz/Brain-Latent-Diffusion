@@ -9,11 +9,44 @@ The current focus is **Flow3D**, a conditional flow matching model. A family of
 **3D diffusion models** precedes it, and older UNet / CVAE / CycleGAN baselines are
 retained as [legacy models](#legacy-models).
 
-## ⚠️ The identity baseline
+## ⚠️ Two things to know before reading any number in this repo
 
-**Read this before interpreting any number in this repo.** Pre- and post-surgery
-volumes are the same brain six months apart, so simply *copying the input* —
-predicting `x_post := x_pre` — is already a strong predictor:
+### 1. The metrics are not brain-masked, and the mask is the wrong one
+
+Every metric documented as "brain-masked" is in fact **whole-volume**, and the
+brain is only ~29 % of that volume.
+
+`ToChannelsFirstAndNormalize` computes z-score statistics over nonzero voxels but
+applies the shift `(t - mean)/std` to the *whole* tensor, so background voxels —
+exactly 0 on input — come out at `-mean/std ≈ -2.4`. Every downstream
+`(x != 0)` mask therefore selects 100 % of the volume. Roughly 71 % of every
+reported metric is measuring how well a model reproduces a constant background.
+
+The mask is also a *union*, `(x_pre != 0) | (x_post != 0)`, which is wrong for a
+comparison: ~5.4 % of it has tissue in one scan and nothing in the other, where no
+pre-vs-post difference exists at all. On that sliver the two preprocessing
+conventions disagree by 6× (mean |x−y| of 0.357 vs 2.034 from the same voxels);
+over the *intersection* they agree exactly. Only the intersection is meaningful.
+
+Corrected, on the seed=42 / `val_frac=0.15` holdout (n=35), the identity predictor
+scores:
+
+| Scoring | MAE ↓ | MSE ↓ | PSNR ↑ | SSIM ↑ |
+|---------|-------|-------|--------|--------|
+| As reported historically (whole volume) | 0.2231 | 0.1471 | 25.25 | 0.8382 |
+| **Brain tissue only** (`--zero_background`, intersection mask) | **0.4717** | **0.4366** | **20.39** | **0.4269** |
+
+The good news is in the last row: a real SSIM of 0.43 means there is far more
+headroom on brain tissue than the whole-volume 0.84 suggested. Flow3D uses the
+corrected convention (`--zero_background`, on by default, plus
+`moyamoya.metrics.tissue_mask`). The diffusion models keep the old preprocessing so
+their checkpoints still reproduce — **their numbers are not comparable to Flow3D's.**
+
+### 2. The identity baseline beats every diffusion model here
+
+Pre- and post-surgery volumes are the same brain six months apart, so simply
+copying the input is a strong predictor. Scored the historical way, so that these
+are like-for-like:
 
 | Model | MAE ↓ | PSNR ↑ | SSIM ↑ |
 |-------|-------|--------|--------|
@@ -21,14 +54,13 @@ predicting `x_post := x_pre` — is already a strong predictor:
 | Best latent diffusion (`runs/2026-08-02_12-56-50_stage2`) | 0.2361 | 23.88 | 0.7997 |
 | Best CDM3D (image space) | 0.3179 | 23.27 | 0.6387 |
 
-(seed=42 / `val_frac=0.15` holdout, n=35, brain-masked, z-score space; diffusion
-figures are each run's *best epoch*.)
+(diffusion figures are each run's *best epoch*.)
 
-Every diffusion model in this repo loses to doing nothing, on every metric. The
-cause is structural rather than a tuning failure: a model that generates `x_post`
-starting from Gaussian noise must re-synthesise the entire brain, when ~78 % of the
-answer was already in the input — and 235 subjects is not enough to win that way.
-It is not the autoencoder's fault either: encoding and decoding the *true* `x_post`
+Every diffusion model loses to doing nothing, on every metric. The cause is
+structural rather than a tuning failure: a model that generates `x_post` starting
+from Gaussian noise must re-synthesise the entire brain, when most of the answer
+was already in the input — and 235 subjects is not enough to win that way. It is
+not the autoencoder's fault either: encoding and decoding the *true* `x_post`
 scores MAE 0.1494 / PSNR 31.63 / SSIM 0.9648, so the latent space is not the
 binding constraint. The generative process is.
 

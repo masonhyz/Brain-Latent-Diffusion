@@ -30,7 +30,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from moyamoya.data import build_loaders
-from moyamoya.metrics import compute_metrics, identity_baseline
+from moyamoya.metrics import compute_metrics, identity_baseline, tissue_mask
 from moyamoya.models.flow3d import EMA, build_flow3d
 from moyamoya.runlog import (
     MetricsCSV, init_wandb, install_run_logger, plot_progression, save_grid,
@@ -58,6 +58,14 @@ def get_args():
                    help="Number of CV folds (used only when --fold is set)")
     p.add_argument("--fold",        type=int,   default=None,
                    help="Held-out fold index 0..n_folds-1. Unset = --val_frac holdout.")
+    p.add_argument("--zero_background",    dest="zero_background", action="store_true",
+                   help="Restore exact zeros outside the acquired volume after "
+                        "z-scoring (on by default here, off for the diffusion "
+                        "models). Without it the background lands at ~-2.4 and "
+                        "every (x != 0) brain mask selects the whole volume, so "
+                        "~71%% of every metric measures a constant background.")
+    p.add_argument("--no-zero-background", dest="zero_background", action="store_false")
+    p.set_defaults(zero_background=True)
     # ── augmentation (paired; see moyamoya/transform.py) ─────────────────────
     p.add_argument("--augment",    dest="augment", action="store_true")
     p.add_argument("--no-augment", dest="augment", action="store_false")
@@ -195,7 +203,7 @@ def evaluate(model, val_dl, device, args, steps: int):
                             guidance_scale=args.guidance_scale,
                             init_noise=args.init_noise)
         for i in range(x.shape[0]):
-            m = compute_metrics(pred[i].float().cpu(), y[i], (x[i] != 0) | (y[i] != 0))
+            m = compute_metrics(pred[i].float().cpu(), y[i], tissue_mask(x[i], y[i]))
             for k in acc:
                 acc[k].append(m[k])
     return {k: float(np.mean(v)) for k, v in acc.items()}
@@ -250,7 +258,14 @@ def main():
     baseline = identity_baseline(val_dl)
     print("\n[identity baseline] predict x_post := x_pre, on this val split:")
     print("   " + "  ".join(f"{k.upper()}={v:.4f}" for k, v in baseline.items()))
-    print("   A model that does not clear this is worse than doing nothing.\n")
+    print("   A model that does not clear this is worse than doing nothing.")
+    if args.zero_background:
+        print("   (brain tissue only — --zero_background makes the mask real. The "
+              "diffusion models' historical numbers are whole-volume and score "
+              "~2x better on MAE purely from the constant background.)\n")
+    else:
+        print("   (whole-volume: with --no-zero-background the mask selects every "
+              "voxel, so ~71% of this is the constant background.)\n")
 
     save_hparams(args, "flow3d", out_dir, extra={
         "dataset": {"data_root": args.data_root, "n_train": n_train, "n_val": n_val,

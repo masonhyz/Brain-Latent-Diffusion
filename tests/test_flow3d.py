@@ -154,6 +154,41 @@ def test_ema_warmup_tracks_then_lags():
     print("  ok  EMA copies during warmup, lags afterwards")
 
 
+def test_zero_background_makes_the_brain_mask_real():
+    """`(x != 0)` must actually select the brain when zero_background is on.
+
+    Flow3D's guarantees — bridge noise confined to the brain, background exactly
+    zero along the path, metrics scored on tissue — all rest on that mask being
+    real. With zero_background off (the historical default) z-scoring shifts the
+    background off zero and the mask degenerates to the whole volume, which is
+    how ~71 % of every metric in this project ends up measuring a constant.
+    """
+    from moyamoya.transform import ToChannelsFirstAndNormalize
+
+    vol = torch.rand(8, 9, 8) + 1.0        # (X,Y,Z), strictly positive "tissue"
+    vol[:4] = 0.0                          # half of it is background
+    true_frac = float((vol != 0).float().mean())
+
+    off = ToChannelsFirstAndNormalize(nonzero_mask=True, zero_background=False)
+    on = ToChannelsFirstAndNormalize(nonzero_mask=True, zero_background=True)
+    x_off, _ = off(vol.clone(), vol.clone())
+    x_on, _ = on(vol.clone(), vol.clone())
+
+    assert float((x_off != 0).float().mean()) == 1.0, (
+        "expected the legacy path to leave a nonzero background; if it no longer "
+        "does, this test and the warnings that cite it are stale")
+    got = float((x_on != 0).float().mean())
+    assert abs(got - true_frac) < 1e-6, (
+        f"zero_background=True should recover the true tissue fraction "
+        f"{true_frac:.3f}, got {got:.3f}")
+    # normalisation itself must be unchanged where there is signal
+    sig = (vol != 0).permute(2, 1, 0).unsqueeze(0)
+    assert torch.allclose(x_on[sig], x_off[sig], atol=1e-6), \
+        "zero_background changed the normalised tissue values"
+    print(f"  ok  zero_background recovers the real mask "
+          f"({true_frac:.2f} of volume) without touching tissue values")
+
+
 def test_no_algebraic_shortcut():
     """The bridge must not be handed x_pre as a separate input channel.
 
