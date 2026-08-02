@@ -154,6 +154,61 @@ def test_ema_warmup_tracks_then_lags():
     print("  ok  EMA copies during warmup, lags afterwards")
 
 
+def test_no_algebraic_shortcut():
+    """The bridge must not be handed x_pre as a separate input channel.
+
+    Along the training path x_t = (1-t)·x_pre + t·x_post, so a network given both
+    x_t and x_pre can return (x_t − x_pre)/t and score a near-zero loss while
+    learning nothing about the pre→post relationship. The probe: train on pairs
+    whose residual is *pure unpredictable noise* of variance 0.25. An honest
+    model cannot beat that floor by much. A shortcut model blows straight
+    through it — which is the signature to catch, because in real training the
+    same collapse hides behind a plausible-looking loss curve.
+    """
+    torch.manual_seed(0)
+    x_pre = torch.randn(8, 1, 24, 28, 24, device=DEV)
+    x_post = x_pre + 0.5 * torch.randn_like(x_pre)      # residual ~ N(0, 0.25)
+    floor = 0.25
+
+    losses = {}
+    for condition in ("concat", "none"):
+        torch.manual_seed(0)
+        m = build_flow3d(dim=16, dim_mults=(1, 2), init_kernel_size=3,
+                         source="pre", condition=condition, sigma=0.0,
+                         zero_init_out=False).to(DEV)
+        assert m.net.init_conv0[0].in_channels == (2 if condition == "concat" else 1)
+        opt = torch.optim.AdamW(m.net.parameters(), lr=3e-3)
+        for _ in range(400):
+            loss = m.flow_loss(x_post, x_pre)
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        losses[condition] = loss.item()
+
+    assert losses["concat"] < 0.1 * floor, (
+        "expected the concat model to exploit the shortcut; if it no longer "
+        "does, this probe has stopped testing anything")
+    assert losses["none"] > losses["concat"] * 3, (
+        f"condition='none' reached {losses['none']:.4f} vs concat "
+        f"{losses['concat']:.4f} — x_pre is still leaking into the network")
+    print(f"  ok  no algebraic shortcut: concat={losses['concat']:.4f} (cheats "
+          f"past the {floor} floor), none={losses['none']:.4f}")
+
+
+def test_default_condition_per_source():
+    """The safe conditioning must be the default, not something to remember."""
+    assert build_flow3d(dim=8, dim_mults=(1, 2), source="pre").condition == "none"
+    assert build_flow3d(dim=8, dim_mults=(1, 2), source="noise").condition == "concat"
+    try:
+        build_flow3d(dim=8, dim_mults=(1, 2), source="noise", condition="none")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("source='noise' + condition='none' must be rejected: "
+                             "the network would never see which subject to predict")
+    print("  ok  condition defaults to 'none' for the bridge, 'concat' for noise")
+
+
 def test_overfit_a_single_pair():
     """The objective must be able to drive a prediction onto its target.
 

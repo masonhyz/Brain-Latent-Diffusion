@@ -127,6 +127,35 @@ so the objective can be compared against the diffusion models with the *architec
 held fixed*: the velocity net is `Unet3D_CDM`, the exact denoiser CDM3D uses, so a
 CDM3D-vs-Flow3D comparison isolates the objective and the sampler.
 
+### The conditioning trap
+
+**The bridge must not receive `x_pre` as a network input**, even though every
+diffusion model in this repo conditions exactly that way. Along the training path
+`x_t = (1-t)·x_pre + t·x_post`, so a network handed both `x_t` and `x_pre` can
+simply return
+
+```
+x_post - x_pre  =  (x_t - x_pre) / t
+```
+
+That is an algebraic identity. It drives the training loss to ~0 while learning
+*nothing* about how pre-op perfusion maps to post-op perfusion, and it is what the
+network will find, because it is far easier than the real task. Measured on pairs
+whose residual is pure unpredictable noise — honest loss floor 0.25 — the concat
+model reaches **0.003**, 80× below the floor.
+
+Sampling then collapses: with the shortcut the trajectory from `x(0) = x_pre` is
+`x_pre + t·v₀`, so the entire prediction is decided by the velocity at `t=0`, the
+one slice of the path the shortcut leaves untrained. This shows up in training as a
+healthy-looking loss curve alongside sampled metrics that drift *away* from the
+identity baseline.
+
+So `--condition` defaults to `none` for `--source pre`: the network sees `x_t` and
+`t` only. Nothing is lost — `x_t` *is* `x_pre` at `t=0` and carries the subject's
+anatomy at every `t`. `--source noise` keeps `concat`, where conditioning is
+indispensable because `x_t` starts as pure noise. `tests/test_flow3d.py::
+test_no_algebraic_shortcut` is the regression test.
+
 ### Training
 
 ```bash

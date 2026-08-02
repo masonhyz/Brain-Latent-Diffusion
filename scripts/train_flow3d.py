@@ -74,6 +74,13 @@ def get_args():
                    help="Source distribution of the flow. 'pre' transports the "
                         "pre-op volume to the post-op volume (bridge); 'noise' is "
                         "standard CFM from N(0,I).")
+    p.add_argument("--condition", type=str, default=None, choices=["none", "concat"],
+                   help="How x_pre reaches the network. Default resolves per "
+                        "source: 'none' for the bridge (x_t already carries the "
+                        "anatomy, and supplying x_pre lets the net solve the path "
+                        "algebraically as (x_t-x_pre)/t instead of learning "
+                        "anything), 'concat' for --source noise, where it is "
+                        "indispensable. Override only to study the failure.")
     p.add_argument("--sigma",  type=float, default=0.1,
                    help="Bridge-noise scale in gamma(t)=sigma*sin(pi*t). Smooths "
                         "the velocity field around the path; 0 = deterministic path.")
@@ -260,11 +267,20 @@ def main():
         dim=args.dim, dim_mults=tuple(args.dim_mults),
         init_kernel_size=args.init_kernel_size, resnet_groups=args.resnet_groups,
         zero_init_out=args.zero_init_out,
-        source=args.source, sigma=args.sigma, t_dist=args.t_dist,
+        source=args.source, condition=args.condition, sigma=args.sigma,
+        t_dist=args.t_dist,
         logit_mean=args.logit_mean, logit_std=args.logit_std,
         l1_weight=args.l1_weight, ssim_weight=args.ssim_weight,
         cfg_drop_prob=args.cfg_drop_prob, steps=args.steps, solver=args.solver,
     ).to(device)
+    # Record what --condition actually resolved to, so the checkpoint rebuilds
+    # the right input width and hparams.json is not ambiguous.
+    args.condition = model.condition
+
+    if args.source == "pre" and args.condition == "concat":
+        print("  ! --source pre with --condition concat lets the network solve "
+              "the path algebraically as (x_t-x_pre)/t; training loss will look "
+              "excellent and sampling will be no better than the input.")
 
     # EMA copy, sampled from at validation time.
     ema_model = deepcopy(model).to(device).eval()
@@ -273,8 +289,9 @@ def main():
     ema = EMA(beta=args.ema_beta, warmup=args.ema_warmup)
 
     n_params = sum(p.numel() for p in model.net.parameters())
-    print(f"[Flow3D] source={args.source} sigma={args.sigma} solver={args.solver} "
-          f"steps={args.steps} | velocity net params: {n_params:,}")
+    print(f"[Flow3D] source={args.source} condition={args.condition} "
+          f"sigma={args.sigma} solver={args.solver} steps={args.steps} | "
+          f"velocity net params: {n_params:,}")
 
     opt = torch.optim.AdamW(model.net.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)

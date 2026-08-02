@@ -43,6 +43,34 @@ objective can be compared against the existing diffusion models with the
 *architecture held fixed* — same U-Net, same conditioning, only the training
 objective and the sampler differ.
 
+The conditioning trap (why the bridge does NOT take x_pre as an input)
+─────────────────────────────────────────────────────────────────────────────
+Every diffusion model here conditions by concatenating x_pre to the network
+input. Doing the same for the bridge silently destroys it.
+
+Along the training path x_t = (1-t)·x_pre + t·x_post, so a network handed both
+x_t and x_pre can just compute
+
+    x_post - x_pre  =  (x_t - x_pre) / t
+
+That is an algebraic identity. It drives the training loss to ~0 while learning
+*nothing whatsoever* about how pre-op perfusion maps to post-op perfusion — and
+it is what the network will find, because it is far easier than the real task.
+Measured directly (``tests/test_flow3d.py::test_no_algebraic_shortcut``): on
+pairs whose residual is pure unpredictable noise, so the honest loss floor is
+0.25, the concat model reaches 0.003 — 80× below the floor.
+
+Sampling then collapses. With the shortcut, v(x_pre, x_t, t) = (x_t - x_pre)/t,
+so an Euler trajectory from x(0) = x_pre is x_pre + t·v₀: it simply extrapolates
+the very first velocity, and the entire prediction is decided by v at t=0 —
+the one slice of the path that the shortcut gives no training signal for.
+
+So for ``source="pre"`` the default is ``condition="none"``: the network sees
+x_t and t only. Nothing is lost, because x_t *is* x_pre at t=0 and carries the
+subject's anatomy at every t — the separate channel was only ever useful for
+cheating. ``source="noise"`` keeps ``condition="concat"``, where it is genuinely
+required: there x_t starts as pure noise and carries no anatomy at all.
+
 Design notes
 ─────────────────────────────────────────────────────────────────────────────
 γ(t) = σ·sin(πt).  The Brownian-bridge choice σ√(t(1-t)) has γ'(t) → ±∞ at both
@@ -161,10 +189,16 @@ class ConditionalFlowMatching3D(nn.Module):
     is the only thing that differs.
 
     Args:
-        net: velocity network mapping (B,2,D,H,W) and (B,) times → (B,1,D,H,W).
+        net: velocity network mapping (B,C,D,H,W) and (B,) times → (B,1,D,H,W),
+            with C = 2 for ``condition="concat"`` and C = 1 for ``"none"``.
         source: ``"pre"`` transports x_pre → x_post (bridge, the default and the
             reason this model exists); ``"noise"`` transports N(0,I) → x_post
             (standard CFM, for a like-for-like comparison against diffusion).
+        condition: how x_pre reaches the network. ``"none"`` — it does not; the
+            network sees x_t alone, which already contains the anatomy. This is
+            required for the bridge: see "The conditioning trap" above.
+            ``"concat"`` — channel concatenation, as the diffusion models do;
+            necessary for ``source="noise"``, ruinous for ``source="pre"``.
         sigma: bridge-noise scale σ in γ(t) = σ·sin(πt). Smooths the velocity
             field around the path; see the module docstring.
         t_dist / logit_mean / logit_std: training-time distribution over t.
@@ -185,6 +219,7 @@ class ConditionalFlowMatching3D(nn.Module):
         self,
         net:           nn.Module,
         source:        str   = "pre",
+        condition:     str   = "none",
         sigma:         float = 0.1,
         t_dist:        str   = "uniform",
         logit_mean:    float = 0.0,
@@ -199,8 +234,16 @@ class ConditionalFlowMatching3D(nn.Module):
         super().__init__()
         if source not in ("pre", "noise"):
             raise ValueError(f"source must be 'pre' or 'noise', got {source!r}")
+        if condition not in ("none", "concat"):
+            raise ValueError(f"condition must be 'none' or 'concat', got {condition!r}")
+        if source == "noise" and condition == "none":
+            raise ValueError(
+                "source='noise' with condition='none' is unconditional generation: "
+                "x_t starts as pure noise, so the network would never see x_pre and "
+                "could not know which subject to predict.")
         self.net           = net
         self.source        = source
+        self.condition     = condition
         self.sigma         = float(sigma)
         self.t_dist        = t_dist
         self.logit_mean    = float(logit_mean)
@@ -239,12 +282,18 @@ class ConditionalFlowMatching3D(nn.Module):
         x_t = (1.0 - tb) * x0 + tb * x_post + g * z
         u_t = (x_post - x0) + gd * z
 
-        x_pre_in = x_pre
-        if self.cfg_drop_prob > 0.0:
-            keep = (torch.rand(B, device=device) >= self.cfg_drop_prob).to(x_pre.dtype)
-            x_pre_in = x_pre * _b(keep)
+        if self.condition == "concat":
+            x_pre_in = x_pre
+            if self.cfg_drop_prob > 0.0:
+                keep = (torch.rand(B, device=device) >= self.cfg_drop_prob).to(x_pre.dtype)
+                x_pre_in = x_pre * _b(keep)
+            net_in = torch.cat([x_pre_in, x_t], dim=1)
+        else:
+            # x_t alone. Handing the network x_pre as well would let it recover
+            # the target algebraically as (x_t - x_pre)/t; see the module docstring.
+            net_in = x_t
 
-        v = self.net(torch.cat([x_pre_in, x_t], dim=1), t * self.time_scale)
+        v = self.net(net_in, t * self.time_scale)
 
         loss = F.mse_loss(v, u_t)
         if self.l1_weight > 0.0:
@@ -274,6 +323,8 @@ class ConditionalFlowMatching3D(nn.Module):
         guidance_scale: float,
         zero_cond:      torch.Tensor,
     ) -> torch.Tensor:
+        if self.condition == "none":
+            return self.net(x, t * self.time_scale).float()
         v = self.net(torch.cat([x_pre, x], dim=1), t * self.time_scale).float()
         if guidance_scale != 1.0:
             v_u = self.net(torch.cat([zero_cond, x], dim=1), t * self.time_scale).float()
@@ -400,6 +451,7 @@ def build_flow3d(
     zero_init_out:    bool  = True,
     # flow
     source:           str   = "pre",
+    condition:        str   = None,
     sigma:            float = 0.1,
     t_dist:           str   = "uniform",
     logit_mean:       float = 0.0,
@@ -414,13 +466,21 @@ def build_flow3d(
 
     The velocity network is ``Unet3D_CDM`` — the same architecture CDM3D uses as
     its denoiser — so a CDM3D-vs-Flow3D comparison isolates the objective and
-    the sampler. It takes cat([x_pre, x_t]) and returns one channel, which here
-    is read as a velocity rather than an x₀ estimate.
+    the sampler. Its single output channel is read as a velocity rather than an
+    x₀ estimate.
+
+    ``condition=None`` resolves per source: ``"none"`` for the bridge (feeding it
+    x_pre would hand it the algebraic shortcut — see the module docstring) and
+    ``"concat"`` for the Gaussian source (where it is indispensable). Pass an
+    explicit value to override, e.g. to reproduce the shortcut deliberately.
     """
+    if condition is None:
+        condition = "none" if source == "pre" else "concat"
+
     net = Unet3D_CDM(
         dim=dim,
         dim_mults=dim_mults,
-        in_channels=2,
+        in_channels=2 if condition == "concat" else 1,
         out_channels=1,
         init_kernel_size=init_kernel_size,
         resnet_groups=resnet_groups,
@@ -439,6 +499,7 @@ def build_flow3d(
     return ConditionalFlowMatching3D(
         net=net,
         source=source,
+        condition=condition,
         sigma=sigma,
         t_dist=t_dist,
         logit_mean=logit_mean,
@@ -455,8 +516,8 @@ def build_flow3d(
 
 _BUILD_KEYS = (
     "dim", "dim_mults", "init_kernel_size", "resnet_groups", "zero_init_out",
-    "source", "sigma", "t_dist", "logit_mean", "logit_std", "l1_weight",
-    "ssim_weight", "cfg_drop_prob", "steps", "solver",
+    "source", "condition", "sigma", "t_dist", "logit_mean", "logit_std",
+    "l1_weight", "ssim_weight", "cfg_drop_prob", "steps", "solver",
 )
 
 
@@ -465,6 +526,9 @@ def build_from_args(args: dict, device="cpu") -> ConditionalFlowMatching3D:
     kw = {k: args[k] for k in _BUILD_KEYS if k in args}
     if "dim_mults" in kw:
         kw["dim_mults"] = tuple(kw["dim_mults"])
+    # Checkpoints written before `condition` existed always concatenated x_pre;
+    # without this they would rebuild with in_channels=1 and fail to load.
+    kw.setdefault("condition", "concat")
     # zero_init_out only affects initialisation; weights are loaded over it.
     return build_flow3d(**kw).to(device)
 
