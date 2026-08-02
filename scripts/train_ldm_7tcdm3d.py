@@ -327,7 +327,7 @@ def get_args():
                    help="Held-out fold index 0..n_folds-1. Unset = --val_frac holdout.")
     # training
     p.add_argument("--epochs",      type=int,   default=None,
-                   help="Override epochs (default: 200 for stage 1, 2000 for stage 2)")
+                   help="Override epochs (default: 200 for stage 1, 1000 for stage 2)")
     p.add_argument("--batch_size",  type=int,   default=2)
     p.add_argument("--lr",          type=float, default=3e-4)
     p.add_argument("--amp",    dest="amp", action="store_true")
@@ -783,7 +783,7 @@ def train_stage2(args, device):
 def main():
     args = get_args()
     if args.epochs is None:
-        args.epochs = 200 if args.stage == 1 else 2000
+        args.epochs = 200 if args.stage == 1 else 1000
     seed_everything(args.seed)
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
