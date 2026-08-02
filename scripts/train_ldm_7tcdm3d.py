@@ -238,12 +238,23 @@ def plot_progression(out_dir: Path, stage: int) -> None:
         ]
         for i, (col, label, color, higher_better) in enumerate(metrics_cfg):
             ax = fig.add_subplot(gs[1, i])
-            ax.plot(s2["epoch"], s2[col], color=color, linewidth=0.7, alpha=0.3)
-            s = _smooth(s2[col], w)
-            ax.plot(s2["epoch"], s, color=color, linewidth=2.0)
+            # metrics are computed only every metric_every epochs, so drop the NaN
+            # gaps before plotting/smoothing (train/val loss remain dense above).
+            valid = ~np.isnan(s2[col])
+            ep_v, val_v = s2["epoch"][valid], s2[col][valid]
+            if len(val_v) == 0:
+                ax.set_title(f"Stage 2 — {label}\n(no metric epochs yet)")
+                ax.set_xlabel("Epoch")
+                ax.set_ylabel(label)
+                ax.grid(True, alpha=0.3)
+                continue
+            wv = max(1, len(ep_v) // 50)
+            ax.plot(ep_v, val_v, color=color, linewidth=0.7, alpha=0.3)
+            s = _smooth(val_v, wv)
+            ax.plot(ep_v, s, color=color, linewidth=2.0)
             best_idx = int(np.nanargmax(s) if higher_better else np.nanargmin(s))
-            ax.axvline(s2["epoch"][best_idx], color="gray", linestyle=":", linewidth=1.0)
-            ax.set_title(f"Stage 2 — {label}\nbest {s[best_idx]:.4f} @ ep {int(s2['epoch'][best_idx])}")
+            ax.axvline(ep_v[best_idx], color="gray", linestyle=":", linewidth=1.0)
+            ax.set_title(f"Stage 2 — {label}\nbest {s[best_idx]:.4f} @ ep {int(ep_v[best_idx])}")
             ax.set_xlabel("Epoch")
             ax.set_ylabel(label)
             ax.grid(True, alpha=0.3)
@@ -322,6 +333,28 @@ def get_args():
     p.add_argument("--amp",    dest="amp", action="store_true")
     p.add_argument("--no-amp", dest="amp", action="store_false")
     p.set_defaults(amp=True)
+    # ── speed / validation cadence (all tunable) ─────────────────────────────
+    # Stage-2 validation runs full DDIM generation, which is ~ddim_steps forward
+    # passes per sample and dominates wall-clock. val_loss (cheap, one forward)
+    # is still computed every epoch; the expensive generation + MAE/MSE/PSNR/SSIM
+    # metrics run only every --metric_every epochs.
+    p.add_argument("--metric_every", type=int, default=5,
+                   help="Stage 2: run full generation + metrics every N epochs "
+                        "(1 = every epoch). val_loss is always logged every epoch.")
+    p.add_argument("--val_ddim_steps", type=int, default=None,
+                   help="DDIM steps for validation-metric generation "
+                        "(default: --ddim_steps). Lower = faster monitoring.")
+    p.add_argument("--tf32",    dest="tf32", action="store_true",
+                   help="Enable TF32 matmul/cudnn (faster on Ampere+; on by default)")
+    p.add_argument("--no-tf32", dest="tf32", action="store_false")
+    p.set_defaults(tf32=True)
+    p.add_argument("--persistent_workers",    dest="persistent_workers",
+                   action="store_true",
+                   help="Keep DataLoader workers alive across epochs "
+                        "(faster for many short epochs; on by default)")
+    p.add_argument("--no-persistent-workers", dest="persistent_workers",
+                   action="store_false")
+    p.set_defaults(persistent_workers=True)
     # stage-1 early stopping: after a warmup of --es_min_epochs, stop once val
     # loss has failed to beat the running best for --es_patience epochs in a row.
     p.add_argument("--es_min_epochs", type=int, default=50,
@@ -598,6 +631,11 @@ def train_stage2(args, device):
     print(f"[Stage 2 – 7TCDM-3D Latent Diffusion] denoiser params: {n_denoiser:,}")
     print(f"  Train {len(train_dl.dataset)} / Val {len(val_dl.dataset)} samples")
 
+    # Full generation dominates wall-clock, so it runs only every metric_every
+    # epochs (val_loss stays every epoch). val_ddim_steps defaults to ddim_steps.
+    val_ddim_steps = args.val_ddim_steps or args.ddim_steps
+    print(f"  Metrics every {args.metric_every} epoch(s) with {val_ddim_steps} DDIM steps")
+
     csv_path = out_dir / "metrics_stage2.csv"
     _init_metrics_csv(csv_path)
 
@@ -611,7 +649,7 @@ def train_stage2(args, device):
         model.denoiser.train()
         tr_loss = 0.0
         for x, y in train_dl:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.amp):
                 loss = model.p_loss(x_post=y, x_pre=x, cfg_drop_prob=args.cfg_drop_prob)
             scaler.scale(loss).backward()
@@ -623,33 +661,49 @@ def train_stage2(args, device):
             tr_loss += loss.item()
         tr_loss /= len(train_dl)
 
-        # ── validation: denoising loss + full generation metrics ──────────────
+        # ── validation ────────────────────────────────────────────────────────
+        # val_loss (one forward) every epoch; the expensive full-generation
+        # metrics only every metric_every epochs (and always on the final epoch).
+        do_metrics = (args.metric_every <= 1
+                      or epoch % args.metric_every == 0
+                      or epoch == args.epochs)
         model.denoiser.eval()
         val_loss = 0.0
         all_metrics = {"mae": [], "mse": [], "psnr": [], "ssim": []}
         with torch.no_grad():
             for x, y in val_dl:
-                x_d, y_d = x.to(device), y.to(device)
+                x_d, y_d = (x.to(device, non_blocking=True),
+                            y.to(device, non_blocking=True))
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.amp):
                     val_loss += model.p_loss(x_post=y_d, x_pre=x_d).item()
-                    pred = model.generate(x_d, ddim_steps=args.ddim_steps,
-                                          guidance_scale=args.guidance_scale)
-
-                mask = (x != 0) | (y != 0)
-                m = compute_metrics(pred.float().cpu(), y, mask)
-                for k in all_metrics:
-                    all_metrics[k].append(m[k])
+                    if do_metrics:
+                        pred = model.generate(x_d, ddim_steps=val_ddim_steps,
+                                              guidance_scale=args.guidance_scale)
+                if do_metrics:
+                    mask = (x != 0) | (y != 0)
+                    m = compute_metrics(pred.float().cpu(), y, mask)
+                    for k in all_metrics:
+                        all_metrics[k].append(m[k])
 
         val_loss /= len(val_dl)
-        epoch_metrics = {k: float(np.mean(v)) for k, v in all_metrics.items()}
+        epoch_metrics = ({k: float(np.mean(v)) for k, v in all_metrics.items()}
+                         if do_metrics
+                         else {k: float("nan") for k in all_metrics})
 
-        print(f"Epoch {epoch:4d}/{args.epochs}  "
-              f"train={tr_loss:.4f}  val={val_loss:.4f}  "
-              f"MAE={epoch_metrics['mae']:.4f}  MSE={epoch_metrics['mse']:.4f}  "
-              f"PSNR={epoch_metrics['psnr']:.2f}  SSIM={epoch_metrics['ssim']:.4f}")
+        if do_metrics:
+            print(f"Epoch {epoch:4d}/{args.epochs}  "
+                  f"train={tr_loss:.4f}  val={val_loss:.4f}  "
+                  f"MAE={epoch_metrics['mae']:.4f}  MSE={epoch_metrics['mse']:.4f}  "
+                  f"PSNR={epoch_metrics['psnr']:.2f}  SSIM={epoch_metrics['ssim']:.4f}")
+        else:
+            print(f"Epoch {epoch:4d}/{args.epochs}  "
+                  f"train={tr_loss:.4f}  val={val_loss:.4f}  (metrics skipped)")
 
         _append_metrics_row(csv_path, epoch, tr_loss, val_loss, epoch_metrics)
-        _wandb_log(run, {"train_loss": tr_loss, "val_loss": val_loss, **epoch_metrics}, step=epoch)
+        log_data = {"train_loss": tr_loss, "val_loss": val_loss}
+        if do_metrics:
+            log_data.update(epoch_metrics)
+        _wandb_log(run, log_data, step=epoch)
 
         # AE is frozen in stage 2, so it is NOT duplicated into every stage-2
         # checkpoint; it lives once in stage1_best.pt and is referenced here.
@@ -666,12 +720,14 @@ def train_stage2(args, device):
             torch.save(ckpt, out_dir / "stage2_best.pt")
             print(f"  → new best val_loss ({best_val:.4f})")
         # additionally keep the best checkpoint for each evaluation metric
-        for k, hib in metric_higher_better.items():
-            cur = epoch_metrics[k]
-            if (cur > best_metric[k]) if hib else (cur < best_metric[k]):
-                best_metric[k] = cur
-                torch.save(ckpt, out_dir / f"stage2_best_{k}.pt")
-                print(f"  → new best {k} ({cur:.4f})")
+        # (only on epochs where metrics were actually computed)
+        if do_metrics:
+            for k, hib in metric_higher_better.items():
+                cur = epoch_metrics[k]
+                if (cur > best_metric[k]) if hib else (cur < best_metric[k]):
+                    best_metric[k] = cur
+                    torch.save(ckpt, out_dir / f"stage2_best_{k}.pt")
+                    print(f"  → new best {k} ({cur:.4f})")
 
         # ── visualisation every vis_every epochs ─────────────────────────────
         if args.vis_every > 0 and epoch % args.vis_every == 0:
@@ -703,6 +759,9 @@ def main():
     if args.epochs is None:
         args.epochs = 200 if args.stage == 1 else 2000
     seed_everything(args.seed)
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     device = get_device()
     print(f"Device: {device}")
 

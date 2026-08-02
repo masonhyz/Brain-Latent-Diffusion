@@ -102,8 +102,15 @@ def build_loaders(args, augment: bool = False):
     )
     train_ds = AugmentedSubset(train_subset, default_augmentation()) if augment else train_subset
 
+    # persistent_workers avoids re-spawning workers every epoch (a real cost with
+    # small datasets + many epochs); only valid when num_workers > 0. Defaults to
+    # True but stays off for the other models, which don't define the arg.
+    persistent = getattr(args, "persistent_workers", False) and args.num_workers > 0
+
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.num_workers, pin_memory=True)
+                          num_workers=args.num_workers, pin_memory=True,
+                          persistent_workers=persistent)
     val_dl   = DataLoader(val_subset, batch_size=1, shuffle=False,
-                          num_workers=args.num_workers, pin_memory=True)
+                          num_workers=args.num_workers, pin_memory=True,
+                          persistent_workers=persistent)
     return train_dl, val_dl
