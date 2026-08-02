@@ -29,6 +29,9 @@ RUN="${1:-}"
 MODE="${2:-}"
 N_FOLDS=7
 SEED=42
+# One timestamp per invocation, shared by all stage-2 folds so a k-fold run's
+# subfolders live under a single ``runs/<RUN>_stage2_<ts>_cv`` parent.
+S2TS="$(date +%Y-%m-%d_%H-%M-%S)"
 
 # If the 1st arg is actually a mode keyword and no 2nd arg was given, the user
 # omitted the run name — treat it as the mode and auto-name the run. Prevents
@@ -65,38 +68,52 @@ run_two_stage() {        # run_two_stage <out_dir> [extra args...]  (AE from sam
     echo "Done. Best checkpoint: ${OUT}/stage2_best.pt"
 }
 
+# Echo a stage-1 AE checkpoint path on stdout, training one if needed. Reuses
+# ``AE_CKPT`` when set (stage 1 skipped); otherwise trains the shared AE once
+# into ``runs/<RUN>_stage1_ae``. All human-readable output goes to stderr so the
+# command substitution ``$(ensure_ae)`` captures only the checkpoint path.
+ensure_ae() {
+    if [ -n "${AE_CKPT}" ]; then
+        [ -f "${AE_CKPT}" ] || { echo "ERROR: AE_CKPT not found: ${AE_CKPT}" >&2; exit 1; }
+        echo "Reusing AE: ${AE_CKPT} (stage 1 skipped)" >&2
+        echo "${AE_CKPT}"
+        return
+    fi
+    local AE_DIR="runs/${RUN}_stage1_ae"
+    echo "========================================================================" >&2
+    echo " Stage 1 (shared AE)  ->  ${AE_DIR}" >&2
+    echo "========================================================================" >&2
+    run_stage1 "${AE_DIR}" 1>&2                   # no --fold => holdout AE
+    echo "${AE_DIR}/stage1_best.pt"
+}
+
 echo "Run name: ${RUN}   |   Mode: ${MODE:-full-cv}"
 
 # ── modes ─────────────────────────────────────────────────────────────────────
+# Layout: stage 1 (rarely retrained) lives in runs/<RUN>_stage1_ae; every stage-2
+# run gets its OWN timestamped folder. A k-fold stage-2 run nests all folds under
+# a single parent runs/<RUN>_stage2_<ts>_cv/fold{0..N}.
 if [ "${MODE}" = "holdout" ]; then
-    # Legacy: single random val_frac=0.15 holdout (200/35), no k-fold anywhere.
-    echo "Mode: legacy holdout (no k-fold)"
-    run_two_stage "runs/${RUN}"
+    # Single random val_frac=0.15 holdout (200/35), no k-fold anywhere.
+    echo "Mode: holdout (no k-fold)"
+    AE="$(ensure_ae)"
+    S2_DIR="runs/${RUN}_stage2_${S2TS}"
+    echo "========================================================================"
+    echo " Stage 2 (holdout)  ->  ${S2_DIR}"
+    echo "========================================================================"
+    run_stage2 "${S2_DIR}" "${AE}"
     echo ""
     echo "Holdout run complete. Eval with:"
-    echo "  python scripts/eval_ldm_7tcdm3d.py --ckpt runs/${RUN}/stage2_best.pt --val_only"
+    echo "  python scripts/eval_ldm_7tcdm3d.py --ckpt ${S2_DIR}/stage2_best.pt --val_only"
 
 elif [ "${MODE}" = "cv2" ]; then
     # Train the AE once (or reuse AE_CKPT), then CV only stage 2. All stage-2
-    # folds reference the one shared AE; the _ae dir is not a _fold* dir, so the
-    # aggregator ignores it.
-    if [ -n "${AE_CKPT}" ]; then
-        AE="${AE_CKPT}"
-        if [ ! -f "${AE}" ]; then
-            echo "ERROR: AE_CKPT not found: ${AE}" >&2; exit 1
-        fi
-        echo "Mode: ${N_FOLDS}-fold CV on stage 2, reusing AE: ${AE} (stage 1 skipped)"
-    else
-        AE_DIR="runs/${RUN}_ae"
-        echo "Mode: AE trained once (${AE_DIR}) + ${N_FOLDS}-fold CV on stage 2"
-        echo "========================================================================"
-        echo " Stage 1 (shared AE)  ->  ${AE_DIR}"
-        echo "========================================================================"
-        run_stage1 "${AE_DIR}"                       # no --fold => holdout AE
-        AE="${AE_DIR}/stage1_best.pt"
-    fi
+    # folds reference the one shared AE and nest under a single _cv parent.
+    echo "Mode: ${N_FOLDS}-fold CV on stage 2 (AE trained once / reused)"
+    AE="$(ensure_ae)"
+    S2_PARENT="runs/${RUN}_stage2_${S2TS}_cv"
     for FOLD in $(seq 0 $((N_FOLDS - 1))); do
-        OUT="runs/${RUN}_fold${FOLD}"
+        OUT="${S2_PARENT}/fold${FOLD}"
         echo "------------------------------------------------------------------------"
         echo " Stage 2, fold ${FOLD}/${N_FOLDS}  ->  ${OUT}"
         echo "------------------------------------------------------------------------"
@@ -105,23 +122,27 @@ elif [ "${MODE}" = "cv2" ]; then
     done
     echo ""
     echo "All stage-2 folds complete. Aggregate the CV metrics with:"
-    echo "  python scripts/aggregate_kfold.py runs/${RUN}"
+    echo "  python scripts/aggregate_kfold.py ${S2_PARENT}"
 
 elif [ -n "${MODE}" ]; then
-    # Single fold of the k-way split, both stages.
+    # Single fold of the k-way split, both stages, nested under a _cv parent so
+    # more folds can be added to the same run later and aggregated together.
     echo "Mode: single fold ${MODE} of ${N_FOLDS} (both stages)"
-    run_two_stage "runs/${RUN}_fold${MODE}" --n_folds ${N_FOLDS} --fold ${MODE}
+    PARENT="runs/${RUN}_${S2TS}_cv"
+    run_two_stage "${PARENT}/fold${MODE}" --n_folds ${N_FOLDS} --fold ${MODE}
     echo ""
     echo "Fold ${MODE} complete. Aggregate available folds with:"
-    echo "  python scripts/aggregate_kfold.py runs/${RUN}"
+    echo "  python scripts/aggregate_kfold.py ${PARENT}"
 
 else
-    # Full k-fold CV: every fold trains both stages on its own split.
+    # Full k-fold CV: every fold trains both stages on its own split, nested
+    # under one timestamped parent.
     echo "Mode: ${N_FOLDS}-fold cross-validation (both stages)"
+    PARENT="runs/${RUN}_${S2TS}_cv"
     for FOLD in $(seq 0 $((N_FOLDS - 1))); do
-        run_two_stage "runs/${RUN}_fold${FOLD}" --n_folds ${N_FOLDS} --fold ${FOLD}
+        run_two_stage "${PARENT}/fold${FOLD}" --n_folds ${N_FOLDS} --fold ${FOLD}
     done
     echo ""
     echo "All folds complete. Aggregate the CV metrics with:"
-    echo "  python scripts/aggregate_kfold.py runs/${RUN}"
+    echo "  python scripts/aggregate_kfold.py ${PARENT}"
 fi

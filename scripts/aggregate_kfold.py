@@ -38,24 +38,29 @@ LABELS = {"val_loss": "val_loss", "mae": "MAE", "mse": "MSE",
           "psnr": "PSNR", "ssim": "SSIM"}
 
 
+def fold_index(d: Path):
+    """Fold number from a dir named ``fold3`` (nested) or ``exp_fold3`` (legacy)."""
+    m = re.search(r"fold(\d+)$", d.name)
+    return int(m.group(1)) if m else -1
+
+
 def find_fold_dirs(base: str):
     """Resolve a base run name to its per-fold directories, sorted by fold index.
 
-    Accepts either ``runs/exp`` (globs ``exp_fold*``) or a single
-    ``runs/exp_fold3`` (that one fold only).
+    Three accepted forms:
+      * nested parent — ``runs/exp_stage2_<ts>_cv`` containing ``fold0/ .. foldN/``
+        (current layout: one timestamped parent per k-fold stage-2 run);
+      * legacy flat   — ``runs/exp`` globbing sibling ``exp_fold*`` dirs;
+      * a single fold — ``.../fold3`` or ``runs/exp_fold3`` (that one fold only).
     """
     base = str(base).rstrip("/")
-    if re.search(r"_fold\d+$", base):
+    if re.search(r"fold\d+$", os.path.basename(base)):          # a single fold dir
         dirs = [base] if os.path.isdir(base) else []
     else:
-        dirs = glob.glob(f"{base}_fold*")
-        dirs = sorted(dirs, key=lambda p: int(re.search(r"_fold(\d+)$", p).group(1)))
-    return [Path(d) for d in dirs if os.path.isdir(d)]
-
-
-def fold_index(d: Path):
-    m = re.search(r"_fold(\d+)$", d.name)
-    return int(m.group(1)) if m else -1
+        nested = glob.glob(os.path.join(base, "fold*"))         # current nested layout
+        dirs   = nested if nested else glob.glob(f"{base}_fold*")  # else legacy flat
+    dirs = [d for d in dirs if os.path.isdir(d)]
+    return sorted((Path(d) for d in dirs), key=fold_index)
 
 
 def read_metrics_csv(path: Path):

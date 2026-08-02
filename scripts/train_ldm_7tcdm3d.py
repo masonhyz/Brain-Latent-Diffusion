@@ -436,7 +436,14 @@ def init_wandb(args, out_dir: Path, stage: int, n_train: int, n_val: int):
               "re-launch after login). Training continues.")
         mode = "offline"
 
-    group = args.wandb_group or re.sub(r"_(fold\d+|ae)$", "", out_dir.name)
+    # Group all runs of one experiment. Prefer an explicit --wandb_group (the
+    # shell always passes one); otherwise derive a stem from the dir name. Nested
+    # k-fold dirs are just ``foldN`` — use the ``..._cv`` parent's name instead.
+    if args.wandb_group:
+        group = args.wandb_group
+    else:
+        name  = out_dir.parent.name if re.fullmatch(r"fold\d+", out_dir.name) else out_dir.name
+        group = re.sub(r"_(stage1_ae|stage1|ae|fold\d+)$|_stage2_.*$|_cv$", "", name)
     fold  = getattr(args, "fold", None)
     config = dict(vars(args))
     config.update(stage=stage, n_train=n_train, n_val=n_val,
@@ -585,13 +592,34 @@ def train_stage1(args, device):
 
 # ── stage 2: latent diffusion ─────────────────────────────────────────────────
 
+def _default_stage2_out_dir(ae_ckpt: str, fold) -> Path:
+    """A fresh stage-2 run dir that is a SIBLING of the AE's dir (never inside it).
+
+    Stage 1 is rarely retrained, so stage 2 gets its own timestamped folder rather
+    than dumping next to the frozen AE checkpoint. An experiment stem is derived
+    from the AE dir name (stripping a trailing ``_stage1_ae`` / ``_ae`` /
+    ``_stage1``); the run lands at ``<stem>_stage2_<timestamp>``. A k-fold run
+    (``fold`` set) nests as ``<stem>_stage2_<timestamp>_cv/fold<N>`` — but real
+    k-fold sweeps pass an explicit ``--out_dir`` per fold (via train_7tcdm3d.sh)
+    so all folds share one parent.
+    """
+    ae_dir = Path(ae_ckpt).resolve().parent
+    stem   = re.sub(r"_(stage1_ae|stage1|ae)$", "", ae_dir.name)
+    ts     = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    runs   = ae_dir.parent                       # e.g. runs/
+    if fold is not None:
+        return runs / f"{stem}_stage2_{ts}_cv" / f"fold{fold}"
+    return runs / f"{stem}_stage2_{ts}"
+
+
 def train_stage2(args, device):
     if args.ae_ckpt is None:
         raise ValueError("--ae_ckpt is required for stage 2")
 
-    # Default stage 2 into the same dir as its autoencoder, so it always lands
-    # next to the stage-1 checkpoint it builds on (never a new timestamped dir).
-    out_dir = Path(args.out_dir or Path(args.ae_ckpt).parent)
+    # Stage 2 lands in its OWN folder, separate from the (rarely retrained) AE.
+    # Pass --out_dir to override; otherwise a fresh sibling dir is created.
+    out_dir = (Path(args.out_dir) if args.out_dir
+               else _default_stage2_out_dir(args.ae_ckpt, getattr(args, "fold", None)))
     out_dir.mkdir(parents=True, exist_ok=True)
     args.out_dir = str(out_dir)
     print(f"[Stage 2] logging to {out_dir}")
