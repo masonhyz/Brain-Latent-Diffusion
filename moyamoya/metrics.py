@@ -76,3 +76,31 @@ def compute_metrics(
         ))
 
     return {"mae": mae, "mse": mse, "psnr": psnr, "ssim": ssim_val}
+
+
+def identity_baseline(pairs, **kw) -> dict:
+    """Metrics of the trivial predictor ``x_post := x_pre``, averaged over ``pairs``.
+
+    This is the number every model on this dataset has to clear, and it is a
+    high bar: pre- and post-surgery volumes are the same brain six months apart,
+    so copying the input already scores MAE ≈ 0.22 / PSNR ≈ 25.2 / SSIM ≈ 0.84 on
+    the seed=42 holdout split. Reporting a model's metrics without it next to
+    them is how a model that is *worse than doing nothing* looks like a result.
+
+    Args:
+        pairs: any iterable of ``(x_pre, x_post)`` — a Dataset, a Subset, or a
+            DataLoader (batched tensors are handled).
+        **kw: forwarded to :func:`compute_metrics` (e.g. ``data_range``).
+
+    Returns:
+        Mean over samples of {"mae", "mse", "psnr", "ssim"}.
+    """
+    acc = {"mae": [], "mse": [], "psnr": [], "ssim": []}
+    for x, y in pairs:
+        # A DataLoader yields (B,C,D,H,W); a Dataset yields (C,D,H,W).
+        batch = [(x[i], y[i]) for i in range(x.shape[0])] if x.ndim == 5 else [(x, y)]
+        for xi, yi in batch:
+            m = compute_metrics(xi, yi, (xi != 0) | (yi != 0), **kw)
+            for k in acc:
+                acc[k].append(m[k])
+    return {k: float(np.mean(v)) for k, v in acc.items()}
