@@ -30,7 +30,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from moyamoya.data import build_loaders
-from moyamoya.metrics import compute_metrics, identity_baseline, tissue_mask
+from moyamoya.metrics import compute_metrics, identity_baseline, union_mask
 from moyamoya.models.flow3d import EMA, build_flow3d
 from moyamoya.runlog import (
     MetricsCSV, init_wandb, install_run_logger, plot_progression, save_grid,
@@ -60,12 +60,13 @@ def get_args():
                    help="Held-out fold index 0..n_folds-1. Unset = --val_frac holdout.")
     p.add_argument("--zero_background",    dest="zero_background", action="store_true",
                    help="Restore exact zeros outside the acquired volume after "
-                        "z-scoring (on by default here, off for the diffusion "
-                        "models). Without it the background lands at ~-2.4 and "
-                        "every (x != 0) brain mask selects the whole volume, so "
-                        "~71%% of every metric measures a constant background.")
+                        "z-scoring. OFF by default to match the 7TCDM3D / LDM "
+                        "models, which z-score the whole volume (background lands "
+                        "at ~-2.4) and score every voxel. Turning it on gives a "
+                        "real brain mask but is NOT how the other models here are "
+                        "evaluated, so the numbers stop being comparable.")
     p.add_argument("--no-zero-background", dest="zero_background", action="store_false")
-    p.set_defaults(zero_background=True)
+    p.set_defaults(zero_background=False)
     # ── augmentation (paired; see moyamoya/transform.py) ─────────────────────
     p.add_argument("--augment",    dest="augment", action="store_true")
     p.add_argument("--no-augment", dest="augment", action="store_false")
@@ -207,7 +208,9 @@ def evaluate(model, val_dl, device, args, steps: int):
                             guidance_scale=args.guidance_scale,
                             init_noise=args.init_noise)
         for i in range(x.shape[0]):
-            m = compute_metrics(pred[i].float().cpu(), y[i], tissue_mask(x[i], y[i]))
+            # Union (whole-volume) mask, exactly as train_ldm_7tcdm3d scores —
+            # `(x != 0) | (y != 0)`. With zero_background off this is every voxel.
+            m = compute_metrics(pred[i].float().cpu(), y[i], union_mask(x[i], y[i]))
             for k in acc:
                 acc[k].append(m[k])
     return {k: float(np.mean(v)) for k, v in acc.items()}
@@ -258,18 +261,20 @@ def main():
     print(f"  Train {n_train} / Val {n_val} samples")
 
     # ── the number to beat ───────────────────────────────────────────────────
-    # Computed on this run's own validation split, before anything is trained.
-    baseline = identity_baseline(val_dl)
+    # Computed on this run's own validation split, before anything is trained,
+    # with the same whole-volume union mask the metrics use so the two are
+    # directly comparable.
+    baseline = identity_baseline(val_dl, mask_fn=union_mask)
     print("\n[identity baseline] predict x_post := x_pre, on this val split:")
     print("   " + "  ".join(f"{k.upper()}={v:.4f}" for k, v in baseline.items()))
     print("   A model that does not clear this is worse than doing nothing.")
     if args.zero_background:
-        print("   (brain tissue only — --zero_background makes the mask real. The "
-              "diffusion models' historical numbers are whole-volume and score "
-              "~2x better on MAE purely from the constant background.)\n")
+        print("   (--zero_background is ON: exact-zero background + whole-volume "
+              "union mask. Note this is NOT the 7TCDM3D/LDM convention.)\n")
     else:
-        print("   (whole-volume: with --no-zero-background the mask selects every "
-              "voxel, so ~71% of this is the constant background.)\n")
+        print("   (whole-volume, matching the 7TCDM3D / LDM models: the whole "
+              "z-scored volume is scored, background included — the same footing "
+              "those models are reported on. ~71% of every metric is background.)\n")
 
     save_hparams(args, "flow3d", out_dir, extra={
         "dataset": {"data_root": args.data_root, "n_train": n_train, "n_val": n_val,

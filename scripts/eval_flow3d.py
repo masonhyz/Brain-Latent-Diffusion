@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from moyamoya.data import reconstruct_val_split
 from moyamoya.dataset import PrePostFMRI
-from moyamoya.metrics import compute_metrics, tissue_mask
+from moyamoya.metrics import compute_metrics, union_mask
 from moyamoya.models.flow3d import load_flow3d_checkpoint
 from moyamoya.runlog import save_grid
 from moyamoya.transform import ToChannelsFirstAndNormalize
@@ -202,7 +202,7 @@ def main():
                 x, y, meta = ds[i]
                 xb = x.unsqueeze(0).to(device)
                 pred = predict(model, xb, args, s, subject_seed(args.sample_seed, meta["id"]))
-                mm = compute_metrics(pred[0].float().cpu(), y, tissue_mask(x, y))
+                mm = compute_metrics(pred[0].float().cpu(), y, union_mask(x, y))
                 for m in METRICS:
                     acc[m].append(mm[m])
             means = {m: float(np.mean(v)) for m, v in acc.items()}
@@ -226,7 +226,8 @@ def main():
         pred = predict(model, xb, args, steps, subject_seed(args.sample_seed, sid))
         pred_c = pred[0].float().cpu()
 
-        mask = tissue_mask(x, y)
+        # Whole-volume union mask, exactly as the 7TCDM3D / LDM models are scored.
+        mask = union_mask(x, y)
         mm = compute_metrics(pred_c, y, mask)
         # The same volume scored against the trivial predictor, subject by
         # subject — so per-subject wins and losses are both visible, not just

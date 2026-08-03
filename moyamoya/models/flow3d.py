@@ -70,10 +70,14 @@ well-defined initial velocity. This is the standard image-to-image-bridge fix
 (cf. I2SB, stochastic interpolants). The default σ is therefore non-zero and the
 factory warns on the σ=0 + bridge + concat combination.
 
-The bridge noise σ·ε is masked to the brain. Outside it x_pre and x_post are both
-exactly 0, so the path must stay at 0 there; the Gaussian *source* of
-``source="noise"`` is deliberately not masked (there it IS the source, and
-sampling starts from a full randn).
+The bridge noise σ·ε is masked by ``(x_pre != 0) | (x_post != 0)``. Under the
+default whole-volume normalisation (``zero_background=False``, matching the
+7TCDM3D/LDM models) the background is a constant ~-2.4 plateau, not 0, so that
+mask is every voxel and the noise is applied everywhere — the model simply learns
+a ~0 velocity on the background plateau and sampling keeps it there. Only under
+``zero_background=True`` (exact-zero background) does the mask actually confine
+the noise to the brain. The Gaussian *source* of ``source="noise"`` is never
+masked (there it IS the source, and sampling starts from a full randn).
 """
 
 import torch
@@ -237,7 +241,9 @@ class ConditionalFlowMatching3D(nn.Module):
         B, device = x_post.size(0), x_post.device
         t = sample_t(B, device, self.t_dist, self.logit_mean, self.logit_std)
 
-        # Brain mask: outside it both volumes are exactly 0 and must stay 0.
+        # Confines the bridge noise to signal voxels. Only bites under
+        # zero_background=True (exact-zero background); with the default
+        # whole-volume normalisation this is every voxel (see module docstring).
         mask = ((x_pre != 0) | (x_post != 0)).to(x_post.dtype)
 
         x0 = x_pre if self.source == "pre" else torch.randn_like(x_post)
@@ -324,8 +330,10 @@ class ConditionalFlowMatching3D(nn.Module):
                 the knob that produces an ensemble of distinct predictions.
             return_traj: also return the list of intermediate states.
 
-        Returns the predicted x_post with the background zeroed, matching the
-        convention of ``PairedLatentDiffusion.generate``.
+        Returns the predicted x_post. The final ``x * brain`` only removes the
+        background under ``zero_background=True`` inputs (where the background is
+        exact 0); with the default whole-volume normalisation ``brain`` is every
+        voxel, so the full volume is returned — as ``cdm3d.sample`` does.
         """
         steps  = int(steps or self.steps)
         solver = solver or self.solver

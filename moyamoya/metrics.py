@@ -101,7 +101,15 @@ def tissue_mask(x_pre, x_post):
     return (x_pre != 0) & (x_post != 0)
 
 
-def identity_baseline(pairs, **kw) -> dict:
+def union_mask(x_pre, x_post):
+    """Whole-volume mask ``(x_pre != 0) | (x_post != 0)`` — the 7TCDM3D/LDM
+    convention. With ``zero_background=False`` normalisation the background is a
+    constant plateau (not 0), so this selects every voxel; use it to score a
+    model *the same way* the diffusion models here are scored."""
+    return (x_pre != 0) | (x_post != 0)
+
+
+def identity_baseline(pairs, mask_fn=tissue_mask, **kw) -> dict:
     """Metrics of the trivial predictor ``x_post := x_pre``, averaged over ``pairs``.
 
     This is the number every model on this dataset has to clear, and it is a
@@ -113,6 +121,9 @@ def identity_baseline(pairs, **kw) -> dict:
     Args:
         pairs: any iterable of ``(x_pre, x_post)`` — a Dataset, a Subset, or a
             DataLoader (batched tensors are handled).
+        mask_fn: ``(x_pre, x_post) -> mask`` selecting the region to score.
+            Defaults to :func:`tissue_mask` (intersection); pass
+            :func:`union_mask` to score whole-volume as the 7TCDM3D/LDM models do.
         **kw: forwarded to :func:`compute_metrics` (e.g. ``data_range``).
 
     Returns:
@@ -123,7 +134,7 @@ def identity_baseline(pairs, **kw) -> dict:
         # A DataLoader yields (B,C,D,H,W); a Dataset yields (C,D,H,W).
         batch = [(x[i], y[i]) for i in range(x.shape[0])] if x.ndim == 5 else [(x, y)]
         for xi, yi in batch:
-            m = compute_metrics(xi, yi, tissue_mask(xi, yi), **kw)
+            m = compute_metrics(xi, yi, mask_fn(xi, yi), **kw)
             for k in acc:
                 acc[k].append(m[k])
     return {k: float(np.mean(v)) for k, v in acc.items()}
