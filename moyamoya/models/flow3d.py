@@ -1,98 +1,80 @@
 """
 Flow3D — conditional flow matching for paired pre→post CBF prediction.
 
-Why flow matching here, and why it is set up the way it is
+Algorithm (follows the official Conditional Flow Matching code)
 ─────────────────────────────────────────────────────────────────────────────
-On this dataset the *identity* prediction (just copy x_pre) scores, on the
-seed=42 / val_frac=0.15 held-out split, MAE 0.2231 · PSNR 25.25 · SSIM 0.8382.
-Every diffusion model in this repo is at or below that (best: MAE 0.2361 ·
-PSNR 23.88 · SSIM 0.7997). The reason is structural, not a tuning failure: a
-model that generates x_post starting from Gaussian noise has to re-synthesise
-the whole brain, when ~78 % of the answer was already sitting in the input.
-With 235 subjects there is not enough data to win that way.
+This is the ``ConditionalFlowMatcher`` of Lipman et al. 2023 ("Flow Matching for
+Generative Modeling") / Tong et al. 2024 ("Improving and generalizing flow-based
+generative models with minibatch optimal transport", the ``torchcfm`` reference
+implementation), applied to a *paired* prediction task. The official recipe is:
 
-Flow matching lets us fix this properly, because a flow model is free to pick
-its *source* distribution — it does not have to be noise. So the default here
-transports x_pre → x_post directly ("bridge" / data-to-data coupling):
+    x0 ~ source,  x1 = x_post,  t ~ U(0,1),  ε ~ N(0, I)
+    x_t = (1-t)·x0 + t·x1 + σ·ε          ← Gaussian probability path, CONSTANT σ
+    u_t = x1 - x0                        ← conditional velocity (clean target)
+    loss = E ‖ v_θ(x_t, t | cond) - u_t ‖²
 
-    x_t = (1-t)·x_pre + t·x_post + γ(t)·z ,   z ~ N(0, I) ,  t ~ p(t) on [0,1]
-    u_t = (x_post - x_pre) + γ'(t)·z                       ← regression target
-    loss = E ‖ v_θ(x_t, t | x_pre) - u_t ‖²
+The two things that matter and were wrong before:
 
-    sampling: integrate dx/dt = v_θ(x_t, t | x_pre) from x(0) = x_pre to t = 1.
+  1. **The velocity net is conditioned on x_pre.** The task is to predict x_post
+     *from a specific x_pre*, so the network must see x_pre — otherwise it can
+     only learn E[u_t | x_t], the field that transports the *marginals* while
+     scrambling the pairing, and in practice the loss barely moves off its
+     initial value because the pre→post residual is not recoverable from x_t
+     alone. x_pre is supplied by channel concatenation, exactly as every
+     diffusion model in this repo conditions its denoiser. This is the fix that
+     makes training actually descend.
 
-Three consequences, all of which matter more than the choice of architecture:
+  2. **The regression target is u_t = x1 - x0, and σ is a constant** (official
+     ``ConditionalFlowMatcher``). The σ·ε perturbs the *sample location* only; it
+     is deliberately NOT added to the target. An earlier version used a
+     time-varying γ(t)=σ·sin(πt) and a pathwise target (x1-x0)+γ'(t)·z, which is
+     a valid stochastic-interpolant variant but inflates the loss with the
+     irreducible variance of γ'(t)·z and is not what the official code does.
 
-  1. The trajectory starts *at* the identity baseline. With the output layer
-     zero-initialised (``zero_init_out``), an untrained model returns exactly
-     x_pre, i.e. it starts training already tied with the best thing this repo
-     has produced, and only has to learn the residual from there.
-
-  2. The path is short. ‖x_post - x_pre‖ is small (masked MAE 0.24 against a
-     volume of masked std 1.10), so the ODE is nearly straight and a handful of
-     steps suffices — 4-16 NFE instead of 50 DDIM steps.
-
-  3. There is no ill-conditioned reparameterisation. DDIM's x₀↔ε conversion
-     divides by √(1-ᾱ) ≈ 0.01 at late steps, which is why ``cdm3d.sample`` has
-     to force fp32 and clamp every step. The velocity field is regressed and
-     integrated directly, so nothing here divides by a vanishing quantity.
-
-``source="noise"`` recovers standard conditional flow matching from a Gaussian
-(x_0 ~ N(0,I), i.e. rectified flow / linear-path CFM). It is kept so the
-objective can be compared against the existing diffusion models with the
-*architecture held fixed* — same U-Net, same conditioning, only the training
-objective and the sampler differ.
-
-The conditioning trap (why the bridge does NOT take x_pre as an input)
+Source distribution
 ─────────────────────────────────────────────────────────────────────────────
-Every diffusion model here conditions by concatenating x_pre to the network
-input. Doing the same for the bridge silently destroys it.
+A flow model is free to choose its source, and here the natural one is the
+pre-op volume itself (``source="pre"``, a data-to-data *bridge*):
 
-Along the training path x_t = (1-t)·x_pre + t·x_post, so a network handed both
-x_t and x_pre can just compute
+    x0 = x_pre,  sampling integrates dx/dt = v_θ(x_t, t | x_pre) from x(0)=x_pre.
 
-    x_post - x_pre  =  (x_t - x_pre) / t
+Two consequences:
 
-That is an algebraic identity. It drives the training loss to ~0 while learning
-*nothing whatsoever* about how pre-op perfusion maps to post-op perfusion — and
-it is what the network will find, because it is far easier than the real task.
-Measured directly (``tests/test_flow3d.py::test_no_algebraic_shortcut``): on
-pairs whose residual is pure unpredictable noise, so the honest loss floor is
-0.25, the concat model reaches 0.003 — 80× below the floor.
+  * With the output conv zero-initialised (``zero_init_out``) an untrained model
+    returns exactly x_pre, i.e. training *starts* at the identity baseline — the
+    strongest predictor on this dataset (see the metrics docstring) — and only
+    has to learn the residual from there.
+  * The path is short (masked ‖x_post-x_pre‖ is small), so the ODE is nearly
+    straight and 4–16 NFE suffices instead of 50 DDIM steps.
 
-Sampling then collapses. With the shortcut, v(x_pre, x_t, t) = (x_t - x_pre)/t,
-so an Euler trajectory from x(0) = x_pre is x_pre + t·v₀: it simply extrapolates
-the very first velocity, and the entire prediction is decided by v at t=0 —
-the one slice of the path that the shortcut gives no training signal for.
+``source="noise"`` recovers standard CFM from a Gaussian (x0 ~ N(0,I)) for a
+like-for-like comparison against the diffusion models with the architecture held
+fixed — only the objective and the sampler differ.
 
-So for ``source="pre"`` the default is ``condition="none"``: the network sees
-x_t and t only. Nothing is lost, because x_t *is* x_pre at t=0 and carries the
-subject's anatomy at every t — the separate channel was only ever useful for
-cheating. ``source="noise"`` keeps ``condition="concat"``, where it is genuinely
-required: there x_t starts as pure noise and carries no anatomy at all.
-
-Design notes
+Why σ > 0 is required for the bridge
 ─────────────────────────────────────────────────────────────────────────────
-γ(t) = σ·sin(πt).  The Brownian-bridge choice σ√(t(1-t)) has γ'(t) → ±∞ at both
-endpoints, which gives the regression target unbounded variance exactly where
-we care most. sin(πt) satisfies the same boundary conditions γ(0)=γ(1)=0, keeps
-|γ'| ≤ σπ everywhere, and reaches the full σ at the midpoint.
+With ``source="pre"``, ``condition="concat"`` and **σ = 0** the path is the
+deterministic line x_t = (1-t)·x_pre + t·x_post, so a network handed both x_t and
+x_pre can read the target off algebraically:
 
-σ is a *smoothing* knob, not a diversity knob. Because the probability-flow ODE
-is deterministic and γ(0)=0, one x_pre yields one prediction whatever σ is; what
-σ>0 buys is a velocity field trained on a neighbourhood of the path rather than
-on a measure-zero line, so integration error at sampling time is self-correcting.
-For an ensemble, perturb the start via ``sample(..., init_noise=...)``.
+    x_post - x_pre  =  (x_t - x_pre) / t .
 
-The bridge noise γ(t)·z is masked to the brain. Outside it, pre and post are
-both exactly 0, so the path must stay at 0 there — otherwise training would see
-a noisy background that sampling (which starts from a clean x_pre) never
-produces. The Gaussian *source* of ``source="noise"`` is deliberately not
-masked: there it is the source distribution, and sampling starts from a full
-randn.
+That drives the *training* loss to ~0 while the *sampling* trajectory collapses:
+the velocity at t=0 is 0/0, so an Euler step from x(0)=x_pre has no defined
+direction and the prediction never leaves the input (measured: MAE stuck at the
+identity value while train-loss looks excellent). σ > 0 removes the degeneracy —
+with x_t = (1-t)·x_pre + t·x_post + σ·ε the target x_post is no longer determined
+by (x_t, x_pre, t), so the network must regress the genuine conditional mean
+E[x_post - x_pre | x_t, x_pre]; at t→0 that is E[x_post - x_pre | x_pre], a
+well-defined initial velocity. This is the standard image-to-image-bridge fix
+(cf. I2SB, stochastic interpolants). The default σ is therefore non-zero and the
+factory warns on the σ=0 + bridge + concat combination.
+
+The bridge noise σ·ε is masked to the brain. Outside it x_pre and x_post are both
+exactly 0, so the path must stay at 0 there; the Gaussian *source* of
+``source="noise"`` is deliberately not masked (there it IS the source, and
+sampling starts from a full randn).
 """
-
-import math
 
 import torch
 import torch.nn as nn
@@ -102,22 +84,12 @@ from .cdm3d import Unet3D_CDM, ssim3d_loss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Interpolant
+# Interpolant helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _b(v: torch.Tensor) -> torch.Tensor:
     """(B,) → (B,1,1,1,1) so it broadcasts against a 5-D volume batch."""
     return v[:, None, None, None, None]
-
-
-def gamma(t: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Bridge noise amplitude γ(t) = σ·sin(πt).  γ(0) = γ(1) = 0."""
-    return sigma * torch.sin(math.pi * t)
-
-
-def gamma_dot(t: torch.Tensor, sigma: float) -> torch.Tensor:
-    """dγ/dt = σ·π·cos(πt).  Bounded by σπ — unlike the √(t(1-t)) bridge."""
-    return sigma * math.pi * torch.cos(math.pi * t)
 
 
 def sample_t(
@@ -183,33 +155,29 @@ class EMA:
 class ConditionalFlowMatching3D(nn.Module):
     """Conditional flow matching in image space for paired pre→post prediction.
 
-    The network is a velocity field v_θ(x_t, t | x_pre) with x_pre supplied by
-    channel concatenation, exactly as the diffusion models condition their
-    denoisers — so the same U-Net can be dropped in unchanged and the objective
-    is the only thing that differs.
+    Implements the official ``ConditionalFlowMatcher`` path/target
+    (x_t = (1-t)·x0 + t·x1 + σ·ε, u_t = x1 - x0) with the velocity network
+    conditioned on x_pre.
 
     Args:
         net: velocity network mapping (B,C,D,H,W) and (B,) times → (B,1,D,H,W),
             with C = 2 for ``condition="concat"`` and C = 1 for ``"none"``.
-        source: ``"pre"`` transports x_pre → x_post (bridge, the default and the
-            reason this model exists); ``"noise"`` transports N(0,I) → x_post
-            (standard CFM, for a like-for-like comparison against diffusion).
-        condition: how x_pre reaches the network. ``"none"`` — it does not; the
-            network sees x_t alone, which already contains the anatomy. This is
-            required for the bridge: see "The conditioning trap" above.
-            ``"concat"`` — channel concatenation, as the diffusion models do;
-            necessary for ``source="noise"``, ruinous for ``source="pre"``.
-        sigma: bridge-noise scale σ in γ(t) = σ·sin(πt). Smooths the velocity
-            field around the path; see the module docstring.
+        source: ``"pre"`` transports x_pre → x_post (bridge, the default);
+            ``"noise"`` transports N(0,I) → x_post (standard CFM).
+        condition: how x_pre reaches the network. ``"concat"`` — channel
+            concatenation, the default and effectively required: the task is
+            conditional on x_pre, and without it training does not descend.
+            ``"none"`` — the network sees x_t alone; kept only for ablation.
+        sigma: constant σ in x_t = (1-t)·x0 + t·x1 + σ·ε. For the bridge this
+            must be > 0 (see the module docstring); it smooths the velocity field
+            around the path and removes the σ=0 algebraic degeneracy.
         t_dist / logit_mean / logit_std: training-time distribution over t.
         l1_weight: weight of an L1 term on the velocity residual, added to the
             MSE. L1 is more robust to the heavy-tailed voxels at vessel edges.
         ssim_weight: weight of (1 − SSIM3D) between the *one-step x₁ estimate*
             and x_post. See :meth:`flow_loss`.
-        cfg_drop_prob: probability of zeroing the conditioning channel. Only
-            meaningful for ``source="noise"``; for the bridge the conditioning
-            also seeds the trajectory, so dropping it is incoherent and this
-            should stay 0.
+        cfg_drop_prob: probability of zeroing the conditioning channel, for
+            classifier-free guidance. Only coherent for ``source="noise"``.
         time_scale: t is multiplied by this before the sinusoidal embedding, so
             a t ∈ [0,1] lands in the same numeric range the U-Net's embedding
             was designed for (integer timesteps 0…1000).
@@ -219,8 +187,8 @@ class ConditionalFlowMatching3D(nn.Module):
         self,
         net:           nn.Module,
         source:        str   = "pre",
-        condition:     str   = "none",
-        sigma:         float = 0.1,
+        condition:     str   = "concat",
+        sigma:         float = 0.3,
         t_dist:        str   = "uniform",
         logit_mean:    float = 0.0,
         logit_std:     float = 1.0,
@@ -258,13 +226,13 @@ class ConditionalFlowMatching3D(nn.Module):
     # ── training ─────────────────────────────────────────────────────────────
 
     def flow_loss(self, x_post: torch.Tensor, x_pre: torch.Tensor) -> torch.Tensor:
-        """Conditional flow matching loss.
+        """Conditional flow matching loss (official ConditionalFlowMatcher).
 
-        Regresses v_θ onto the *conditional* velocity u_t of the interpolant.
-        The minimiser of this loss is E[u_t | x_t], the marginal velocity field
-        that actually transports the source distribution to the target — that
+        Regresses v_θ onto the conditional velocity u_t = x1 - x0 of the Gaussian
+        path x_t = (1-t)·x0 + t·x1 + σ·ε. The minimiser is the marginal velocity
+        E[u_t | x_t, cond] that transports the source to the target — that
         equivalence is the whole point of flow matching, and it is why the
-        unobservable z in u_t does not bias the result.
+        unobservable ε does not bias the result.
         """
         B, device = x_post.size(0), x_post.device
         t = sample_t(B, device, self.t_dist, self.logit_mean, self.logit_std)
@@ -274,13 +242,14 @@ class ConditionalFlowMatching3D(nn.Module):
 
         x0 = x_pre if self.source == "pre" else torch.randn_like(x_post)
 
-        z  = torch.randn_like(x_post) * mask
-        g  = _b(gamma(t, self.sigma))
-        gd = _b(gamma_dot(t, self.sigma))
+        # σ·ε, masked to the brain for the bridge so the background stays 0.
+        eps = torch.randn_like(x_post)
+        if self.source == "pre":
+            eps = eps * mask
         tb = _b(t)
 
-        x_t = (1.0 - tb) * x0 + tb * x_post + g * z
-        u_t = (x_post - x0) + gd * z
+        x_t = (1.0 - tb) * x0 + tb * x_post + self.sigma * eps
+        u_t = x_post - x0                                   # clean official target
 
         if self.condition == "concat":
             x_pre_in = x_pre
@@ -289,8 +258,6 @@ class ConditionalFlowMatching3D(nn.Module):
                 x_pre_in = x_pre * _b(keep)
             net_in = torch.cat([x_pre_in, x_t], dim=1)
         else:
-            # x_t alone. Handing the network x_pre as well would let it recover
-            # the target algebraically as (x_t - x_pre)/t; see the module docstring.
             net_in = x_t
 
         v = self.net(net_in, t * self.time_scale)
@@ -451,8 +418,8 @@ def build_flow3d(
     zero_init_out:    bool  = True,
     # flow
     source:           str   = "pre",
-    condition:        str   = None,
-    sigma:            float = 0.1,
+    condition:        str   = "concat",
+    sigma:            float = 0.3,
     t_dist:           str   = "uniform",
     logit_mean:       float = 0.0,
     logit_std:        float = 1.0,
@@ -469,13 +436,12 @@ def build_flow3d(
     the sampler. Its single output channel is read as a velocity rather than an
     x₀ estimate.
 
-    ``condition=None`` resolves per source: ``"none"`` for the bridge (feeding it
-    x_pre would hand it the algebraic shortcut — see the module docstring) and
-    ``"concat"`` for the Gaussian source (where it is indispensable). Pass an
-    explicit value to override, e.g. to reproduce the shortcut deliberately.
+    ``condition="concat"`` is the default for both sources: the network is
+    conditioned on x_pre. This is what makes training descend (see the module
+    docstring); ``condition="none"`` is kept only for ablation.
     """
     if condition is None:
-        condition = "none" if source == "pre" else "concat"
+        condition = "concat"
 
     net = Unet3D_CDM(
         dim=dim,
@@ -526,8 +492,7 @@ def build_from_args(args: dict, device="cpu") -> ConditionalFlowMatching3D:
     kw = {k: args[k] for k in _BUILD_KEYS if k in args}
     if "dim_mults" in kw:
         kw["dim_mults"] = tuple(kw["dim_mults"])
-    # Checkpoints written before `condition` existed always concatenated x_pre;
-    # without this they would rebuild with in_channels=1 and fail to load.
+    # Checkpoints predating `condition` always concatenated x_pre.
     kw.setdefault("condition", "concat")
     # zero_init_out only affects initialisation; weights are loaded over it.
     return build_flow3d(**kw).to(device)

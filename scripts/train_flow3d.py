@@ -82,16 +82,16 @@ def get_args():
                    help="Source distribution of the flow. 'pre' transports the "
                         "pre-op volume to the post-op volume (bridge); 'noise' is "
                         "standard CFM from N(0,I).")
-    p.add_argument("--condition", type=str, default=None, choices=["none", "concat"],
-                   help="How x_pre reaches the network. Default resolves per "
-                        "source: 'none' for the bridge (x_t already carries the "
-                        "anatomy, and supplying x_pre lets the net solve the path "
-                        "algebraically as (x_t-x_pre)/t instead of learning "
-                        "anything), 'concat' for --source noise, where it is "
-                        "indispensable. Override only to study the failure.")
-    p.add_argument("--sigma",  type=float, default=0.1,
-                   help="Bridge-noise scale in gamma(t)=sigma*sin(pi*t). Smooths "
-                        "the velocity field around the path; 0 = deterministic path.")
+    p.add_argument("--condition", type=str, default="concat", choices=["none", "concat"],
+                   help="How x_pre reaches the network. 'concat' (default, and "
+                        "effectively required): x_pre is channel-concatenated so "
+                        "the network is conditioned on it — without this the loss "
+                        "barely descends. 'none' is an ablation that sees x_t only.")
+    p.add_argument("--sigma",  type=float, default=0.3,
+                   help="Constant noise scale in x_t=(1-t)*x0+t*x1+sigma*eps "
+                        "(official ConditionalFlowMatcher path). For the bridge it "
+                        "must be > 0: sigma=0 makes x_post recoverable as "
+                        "(x_t-x_pre)/t and sampling collapses. Smooths the field.")
     p.add_argument("--t_dist", type=str, default="uniform",
                    choices=["uniform", "logit_normal"],
                    help="Training-time distribution over t. logit_normal is the "
@@ -296,10 +296,14 @@ def main():
     # the right input width and hparams.json is not ambiguous.
     args.condition = model.condition
 
-    if args.source == "pre" and args.condition == "concat":
-        print("  ! --source pre with --condition concat lets the network solve "
-              "the path algebraically as (x_t-x_pre)/t; training loss will look "
-              "excellent and sampling will be no better than the input.")
+    if args.source == "pre" and args.condition == "concat" and args.sigma == 0.0:
+        print("  ! --source pre --condition concat with --sigma 0 lets the network "
+              "solve the path algebraically as (x_t-x_pre)/t: training loss will "
+              "look excellent and sampling will collapse to the input. Use --sigma>0.")
+    if args.condition == "none":
+        print("  ! --condition none: the velocity net never sees x_pre, so it can "
+              "only learn E[u_t | x_t] and the loss barely descends. This is an "
+              "ablation; use --condition concat for real training.")
 
     # EMA copy, sampled from at validation time.
     ema_model = deepcopy(model).to(device).eval()
