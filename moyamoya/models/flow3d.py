@@ -82,7 +82,6 @@ masked (there it IS the source, and sampling starts from a full randn).
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .cdm3d import Unet3D_CDM, ssim3d_loss
 
@@ -116,6 +115,39 @@ def sample_t(
     if dist == "logit_normal":
         return torch.sigmoid(logit_mean + logit_std * torch.randn(batch, device=device))
     raise ValueError(f"unknown t distribution: {dist!r} (use 'uniform' or 'logit_normal')")
+
+
+def change_weight_map(
+    x_pre:  torch.Tensor,
+    x_post: torch.Tensor,
+    gamma:  float,
+    eps:    float = 1e-6,
+) -> torch.Tensor:
+    """Per-voxel loss weight emphasising where the scan actually changes.
+
+        w = 1 + γ·|x_post − x_pre| / scale,      scale = per-sample mean |Δ|
+        w ← w / mean(w)                           (renormalised, per sample)
+
+    The renormalisation makes ``w`` average to 1 over every sample, so the loss
+    magnitude — and therefore the effective learning rate — is identical to the
+    unweighted MSE; γ only *redistributes* gradient toward the voxels that differ
+    between pre and post. That is the whole fix: with a flat weight the vast
+    near-zero-Δ majority dominates and v≡0 (copy x_pre) minimises the loss, so the
+    sparse surgical edits are never learned. γ=0 returns all-ones (plain MSE).
+
+    Δ is normalised by its own per-sample mean, so the emphasis is scale-invariant
+    across subjects: a subject with a small absolute change still has its changed
+    voxels up-weighted relative to its own unchanged ones. *Which* subjects to
+    dwell on is the sampler's job (see moyamoya/data.py), not this weight's.
+
+    A pure function of the data — carries no gradient. Shapes (B,C,D,H,W) (or any
+    (B, …) tensor); the reduction is over every non-batch dim.
+    """
+    c = (x_post - x_pre).abs()
+    dims = tuple(range(1, c.ndim))
+    scale = c.mean(dim=dims, keepdim=True).clamp_min(eps)
+    w = 1.0 + gamma * (c / scale)
+    return w / w.mean(dim=dims, keepdim=True).clamp_min(eps)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -176,8 +208,20 @@ class ConditionalFlowMatching3D(nn.Module):
             must be > 0 (see the module docstring); it smooths the velocity field
             around the path and removes the σ=0 algebraic degeneracy.
         t_dist / logit_mean / logit_std: training-time distribution over t.
+        change_weight: γ in the per-voxel loss weight w = 1 + γ·(|Δ|/scale),
+            where Δ = x_post − x_pre is the *change map* (the very thing the bridge
+            regresses, since u_t = x_post − x_pre) and scale is Δ's per-sample mean.
+            w is then renormalised to mean 1 per sample, so the loss magnitude —
+            and hence the effective learning rate — is unchanged; γ only
+            *redistributes* emphasis toward the voxels that actually change between
+            pre- and post-op. This is the fix for the identity-collapse failure:
+            with a flat MSE the near-zero Δ of the vast unchanged majority drowns
+            out the sparse edits, so v≈0 (copy x_pre) is the minimiser. γ=0
+            recovers the plain MSE exactly. Only applied for source="pre" (Δ is
+            only the target velocity for the bridge). See :meth:`flow_loss`.
         l1_weight: weight of an L1 term on the velocity residual, added to the
             MSE. L1 is more robust to the heavy-tailed voxels at vessel edges.
+            Change-weighted with the same w as the MSE term.
         ssim_weight: weight of (1 − SSIM3D) between the *one-step x₁ estimate*
             and x_post. See :meth:`flow_loss`.
         cfg_drop_prob: probability of zeroing the conditioning channel, for
@@ -196,6 +240,7 @@ class ConditionalFlowMatching3D(nn.Module):
         t_dist:        str   = "uniform",
         logit_mean:    float = 0.0,
         logit_std:     float = 1.0,
+        change_weight: float = 5.0,
         l1_weight:     float = 0.0,
         ssim_weight:   float = 0.0,
         cfg_drop_prob: float = 0.0,
@@ -220,6 +265,7 @@ class ConditionalFlowMatching3D(nn.Module):
         self.t_dist        = t_dist
         self.logit_mean    = float(logit_mean)
         self.logit_std     = float(logit_std)
+        self.change_weight = float(change_weight)
         self.l1_weight     = float(l1_weight)
         self.ssim_weight   = float(ssim_weight)
         self.cfg_drop_prob = float(cfg_drop_prob)
@@ -237,6 +283,12 @@ class ConditionalFlowMatching3D(nn.Module):
         E[u_t | x_t, cond] that transports the source to the target — that
         equivalence is the whole point of flow matching, and it is why the
         unobservable ε does not bias the result.
+
+        The squared (and optional L1) residual is weighted per voxel by
+        :func:`change_weight_map` (γ = ``self.change_weight``) so the sparse
+        surgical edits are not averaged away by the near-identity majority — the
+        cause of the copy-x_pre collapse. The weight averages to 1 per sample, so
+        with γ=0 this is exactly ``F.mse_loss(v, u_t)``.
         """
         B, device = x_post.size(0), x_post.device
         t = sample_t(B, device, self.t_dist, self.logit_mean, self.logit_std)
@@ -268,9 +320,21 @@ class ConditionalFlowMatching3D(nn.Module):
 
         v = self.net(net_in, t * self.time_scale)
 
-        loss = F.mse_loss(v, u_t)
+        # Change-weighted regression. w up-weights the voxels that actually differ
+        # between pre and post so the sparse edits are not averaged away by the
+        # near-identity majority (the copy-x_pre collapse). Only for the bridge,
+        # where Δ = x_post − x_pre is literally the target velocity; γ=0 or
+        # source="noise" fall back to the flat MSE. w averages to 1 per sample, so
+        # (w·se).mean() matches F.mse_loss(v, u_t) when γ=0.
+        w = (change_weight_map(x_pre, x_post, self.change_weight)
+             if (self.change_weight > 0.0 and self.source == "pre") else None)
+
+        diff = v - u_t
+        se = diff.pow(2)
+        loss = se.mean() if w is None else (w * se).mean()
         if self.l1_weight > 0.0:
-            loss = loss + self.l1_weight * (v - u_t).abs().mean()
+            ae = diff.abs()
+            loss = loss + self.l1_weight * (ae.mean() if w is None else (w * ae).mean())
 
         if self.ssim_weight > 0.0:
             # x̂₁ from a single Euler step to t=1: x_t + (1-t)·v. This is the
@@ -431,6 +495,7 @@ def build_flow3d(
     t_dist:           str   = "uniform",
     logit_mean:       float = 0.0,
     logit_std:        float = 1.0,
+    change_weight:    float = 5.0,
     l1_weight:        float = 0.0,
     ssim_weight:      float = 0.0,
     cfg_drop_prob:    float = 0.0,
@@ -478,6 +543,7 @@ def build_flow3d(
         t_dist=t_dist,
         logit_mean=logit_mean,
         logit_std=logit_std,
+        change_weight=change_weight,
         l1_weight=l1_weight,
         ssim_weight=ssim_weight,
         cfg_drop_prob=cfg_drop_prob,
@@ -491,7 +557,7 @@ def build_flow3d(
 _BUILD_KEYS = (
     "dim", "dim_mults", "init_kernel_size", "resnet_groups", "zero_init_out",
     "source", "condition", "sigma", "t_dist", "logit_mean", "logit_std",
-    "l1_weight", "ssim_weight", "cfg_drop_prob", "steps", "solver",
+    "change_weight", "l1_weight", "ssim_weight", "cfg_drop_prob", "steps", "solver",
 )
 
 

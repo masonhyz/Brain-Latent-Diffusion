@@ -5,8 +5,11 @@ copy-pasted across every train and eval script, so training and evaluation
 provably use the *same* held-out validation subjects.
 """
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.utils.data import (
+    DataLoader, Dataset, Subset, WeightedRandomSampler, random_split,
+)
 
 from .dataset import PrePostFMRI
 from .transform import (
@@ -135,6 +138,53 @@ def default_augmentation():
     return build_augmentation()
 
 
+def change_magnitudes(subset) -> np.ndarray:
+    """Per-subject global change ``mean|x_post − x_pre|`` over the brain, in order.
+
+    Loads every volume in ``subset`` once (with the base normalising transform, no
+    augmentation), so it runs at loader-construction time. Restricting the mean to
+    the brain (see :func:`~moyamoya.metrics.foreground_mask`) is what makes it a
+    real change measure: under whole-volume normalisation the background is a
+    near-constant plateau, so averaging over it would just add the same offset to
+    every subject and wash out their differences.
+    """
+    from .metrics import foreground_mask
+    mags = []
+    for x, y in subset:
+        fg = foreground_mask(x, y)
+        d = (y - x).abs().numpy().squeeze()
+        mags.append(float(d[fg].mean()) if fg.any() else 0.0)
+    return np.asarray(mags, dtype=np.float64)
+
+
+def change_sampler(subset, beta: float):
+    """A ``WeightedRandomSampler`` that oversamples the big-change subjects.
+
+        weight_i ∝ 1 + β · (g_i / median g)
+
+    with g_i the subject's global change (:func:`change_magnitudes`). β=0 is
+    uniform; larger β spends more of each epoch on the subjects where pre and post
+    genuinely differ — the pairs that carry the "make a real edit" signal, which
+    is otherwise drowned out by the near-identity majority. Kept deliberately mild
+    by default: with only ~200 subjects, aggressively oversampling the handful of
+    large-change cases overfits them. The finer-grained voxel weighting
+    (:func:`~moyamoya.models.flow3d.change_weight_map`) is the safer primary lever;
+    this is the complementary coarse one.
+
+    Returns ``(sampler, g)`` — ``g`` is the change vector, for logging.
+    """
+    g = change_magnitudes(subset)
+    med = float(np.median(g))
+    if med <= 0:
+        med = float(g.mean()) if g.mean() > 0 else 1.0
+    w = np.clip(1.0 + beta * (g / med), 1e-6, None)
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(w, dtype=torch.double),
+        num_samples=len(g), replacement=True,
+    )
+    return sampler, g
+
+
 def build_loaders(args, augment: bool = False):
     """Build (train_dl, val_dl) from ``args`` (data_root, val_frac, seed,
     batch_size, num_workers). When ``augment`` is set, the train split is wrapped
@@ -165,7 +215,22 @@ def build_loaders(args, augment: bool = False):
     # True but stays off for the other models, which don't define the arg.
     persistent = getattr(args, "persistent_workers", False) and args.num_workers > 0
 
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+    # Optional change-emphasis sampler: oversample the subjects whose post-op scan
+    # genuinely differs from the pre-op one, so the "make a real edit" signal is
+    # not drowned out by the near-identity majority. Off unless --change_sampler_beta
+    # > 0. Replaces shuffle (a sampler and shuffle=True are mutually exclusive).
+    beta = float(getattr(args, "change_sampler_beta", 0.0) or 0.0)
+    sampler = None
+    if beta > 0:
+        print(f"[change-sampler] computing per-subject change over {len(train_subset)} "
+              f"training volumes (one-time)...")
+        sampler, g = change_sampler(train_subset, beta)
+        print(f"[change-sampler] beta={beta}  global change: min={g.min():.3f} "
+              f"median={np.median(g):.3f} max={g.max():.3f} — oversampling "
+              f"large-change subjects (weight ∝ 1+beta·g/median).")
+
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size,
+                          shuffle=(sampler is None), sampler=sampler,
                           num_workers=args.num_workers, pin_memory=True,
                           persistent_workers=persistent)
     val_dl   = DataLoader(val_subset, batch_size=1, shuffle=False,

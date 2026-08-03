@@ -30,7 +30,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from moyamoya.data import build_loaders
-from moyamoya.metrics import compute_metrics, identity_baseline, union_mask
+from moyamoya.metrics import (
+    change_region_report, compute_metrics, identity_baseline, union_mask,
+)
 from moyamoya.models.flow3d import EMA, build_flow3d
 from moyamoya.runlog import (
     MetricsCSV, init_wandb, install_run_logger, plot_progression, save_grid,
@@ -99,6 +101,26 @@ def get_args():
                         "SD3 schedule (concentrates on mid-path).")
     p.add_argument("--logit_mean", type=float, default=0.0)
     p.add_argument("--logit_std",  type=float, default=1.0)
+    # ── change-aware training (the identity-collapse fix) ─────────────────────
+    p.add_argument("--change_weight", type=float, default=5.0,
+                   help="gamma in the per-voxel loss weight w=1+gamma*|dchange|/scale "
+                        "(renormalised to mean 1 per sample). Up-weights the voxels "
+                        "that actually differ between pre and post so the sparse "
+                        "surgical edits are not averaged away by the near-identity "
+                        "majority — the cause of the copy-x_pre collapse. 0 = plain "
+                        "MSE (ablation). Only applied for --source pre.")
+    p.add_argument("--change_sampler_beta", type=float, default=0.0,
+                   help="Oversample big-change subjects with a WeightedRandomSampler, "
+                        "weight ∝ 1+beta*g/median(g) with g the subject's global "
+                        "change. 0 = uniform. Keep modest (<=1) with ~200 subjects — "
+                        "the per-voxel --change_weight is the safer primary lever; "
+                        "this is the complementary coarse one (your 'focus on the "
+                        "pairs that differ' idea).")
+    p.add_argument("--change_roi_frac", type=float, default=0.05,
+                   help="Fraction of most-changed brain voxels that define the "
+                        "change-region ROI reported at validation (change/* metrics). "
+                        "This is where a model can actually beat identity; the "
+                        "whole-volume metrics are blind to it.")
     p.add_argument("--l1_weight",   type=float, default=0.0,
                    help="Weight of an L1 term on the velocity residual (added to MSE)")
     p.add_argument("--ssim_weight", type=float, default=0.0,
@@ -198,22 +220,41 @@ def report_gpu(device) -> None:
               f"another device, or lower --dim / --init_kernel_size.")
 
 
+CHANGE_KEYS = ("change_mae", "change_psnr", "change_ssim",
+               "identity_change_mae", "change_mae_improvement", "change_roi_frac")
+
+
 @torch.no_grad()
 def evaluate(model, val_dl, device, args, steps: int):
-    """Sampled predictions over the val split → mean metrics."""
+    """Sampled predictions over the val split → (whole-volume, change-region) means.
+
+    Whole-volume metrics are the union-mask numbers the 7TCDM3D/LDM models report
+    (comparable, but ~71% background). Change-region metrics score only the ROI
+    where surgery actually altered the scan (see metrics.change_region_report) —
+    the number that reveals whether the model learned the substantial edits.
+    """
     acc = {"mae": [], "mse": [], "psnr": [], "ssim": []}
+    cacc = {k: [] for k in CHANGE_KEYS}
     for x, y in val_dl:
         x_d = x.to(device, non_blocking=True)
         pred = model.sample(x_d, steps=steps, solver=args.solver,
                             guidance_scale=args.guidance_scale,
                             init_noise=args.init_noise)
         for i in range(x.shape[0]):
+            p = pred[i].float().cpu()
             # Union (whole-volume) mask, exactly as train_ldm_7tcdm3d scores —
             # `(x != 0) | (y != 0)`. With zero_background off this is every voxel.
-            m = compute_metrics(pred[i].float().cpu(), y[i], union_mask(x[i], y[i]))
+            m = compute_metrics(p, y[i], union_mask(x[i], y[i]))
             for k in acc:
                 acc[k].append(m[k])
-    return {k: float(np.mean(v)) for k, v in acc.items()}
+            cm = change_region_report(p, x[i], y[i], frac=args.change_roi_frac)
+            for k in cacc:
+                cacc[k].append(cm[k])
+    whole  = {k: float(np.mean(v)) for k, v in acc.items()}
+    # nanmean: a subject with an empty ROI (no change) contributes NaN, skip it.
+    change = {k: (float(np.nanmean(v)) if len(v) else float("nan"))
+              for k, v in cacc.items()}
+    return whole, change
 
 
 def main():
@@ -294,6 +335,7 @@ def main():
         source=args.source, condition=args.condition, sigma=args.sigma,
         t_dist=args.t_dist,
         logit_mean=args.logit_mean, logit_std=args.logit_std,
+        change_weight=args.change_weight,
         l1_weight=args.l1_weight, ssim_weight=args.ssim_weight,
         cfg_drop_prob=args.cfg_drop_prob, steps=args.steps, solver=args.solver,
     ).to(device)
@@ -309,6 +351,10 @@ def main():
         print("  ! --condition none: the velocity net never sees x_pre, so it can "
               "only learn E[u_t | x_t] and the loss barely descends. This is an "
               "ablation; use --condition concat for real training.")
+    if args.source == "noise" and args.change_weight > 0:
+        print(f"  ! --change_weight {args.change_weight} is ignored for --source noise "
+              f"(there the target velocity is x_post−noise, not the change map). The "
+              f"change weighting only applies to the bridge (--source pre).")
 
     # EMA copy, sampled from at validation time.
     ema_model = deepcopy(model).to(device).eval()
@@ -331,11 +377,14 @@ def main():
 
     csv_log = MetricsCSV(out_dir / "metrics.csv",
                          ["epoch", "lr", "train_loss", "val_loss",
-                          "mae", "mse", "psnr", "ssim"])
+                          "mae", "mse", "psnr", "ssim",
+                          "change_mae", "identity_change_mae",
+                          "change_mae_improvement", "change_psnr", "change_ssim"])
     vis_dir = out_dir / "vis"
     vis_dir.mkdir(exist_ok=True)
 
     best_val = float("inf")
+    best_change = float("-inf")   # best change-ROI improvement over identity
     best_metric = {k: (float("-inf") if hib else float("inf"))
                    for k, hib in METRIC_HIGHER_BETTER.items()}
 
@@ -384,8 +433,9 @@ def main():
         val_loss /= max(len(val_dl), 1)
 
         # Sampled metrics use the EMA weights — that is what eval/inference load.
-        m = (evaluate(ema_model, val_dl, device, args, val_steps) if do_metrics
-             else {k: float("nan") for k in METRIC_HIGHER_BETTER})
+        m, cm = (evaluate(ema_model, val_dl, device, args, val_steps) if do_metrics
+                 else ({k: float("nan") for k in METRIC_HIGHER_BETTER},
+                       {k: float("nan") for k in CHANGE_KEYS}))
 
         if do_metrics:
             flags = "".join(
@@ -396,12 +446,19 @@ def main():
                   f"MAE={m['mae']:.4f}  MSE={m['mse']:.4f}  "
                   f"PSNR={m['psnr']:.2f}  SSIM={m['ssim']:.4f}  "
                   f"[vs identity: {flags}]")
+            # The number the whole-volume metrics can't show: error in the region
+            # that actually changed, and whether it beats copying x_pre there.
+            print(f"            change-ROI (top {args.change_roi_frac:.0%}): "
+                  f"MAE={cm['change_mae']:.4f} vs identity {cm['identity_change_mae']:.4f} "
+                  f"(Δ={cm['change_mae_improvement']:+.4f}, "
+                  f"{'BEATS' if cm['change_mae_improvement'] > 0 else 'loses to'} identity)  "
+                  f"PSNR={cm['change_psnr']:.2f}  SSIM={cm['change_ssim']:.4f}")
         else:
             print(f"Epoch {epoch:4d}/{args.epochs}  lr={lr:.2e}  "
                   f"train={tr_loss:.4f}  val={val_loss:.4f}")
 
         csv_log.append({"epoch": epoch, "lr": lr, "train_loss": tr_loss,
-                        "val_loss": val_loss, **m})
+                        "val_loss": val_loss, **m, **cm})
         log = {"train_loss": tr_loss, "val_loss": val_loss, "lr": lr}
         if do_metrics:
             log.update(m)
@@ -415,6 +472,14 @@ def main():
             log["beats_identity_count"] = sum(
                 1 for k, hib in METRIC_HIGHER_BETTER.items()
                 if ((m[k] > baseline[k]) if hib else (m[k] < baseline[k])))
+            # Change-region panel: the model's error where surgery edits the scan,
+            # the identity error there, and the signed improvement (the headline).
+            log["change/mae"]           = cm["change_mae"]
+            log["change/psnr"]          = cm["change_psnr"]
+            log["change/ssim"]          = cm["change_ssim"]
+            log["change/identity_mae"]  = cm["identity_change_mae"]
+            log["change/mae_improvement"] = cm["change_mae_improvement"]
+            log["change/roi_frac"]      = cm["change_roi_frac"]
         wandb_log(run, log, step=epoch)
 
         ckpt = checkpoint()
@@ -428,6 +493,12 @@ def main():
                     best_metric[k] = m[k]
                     torch.save(ckpt, out_dir / f"best_{k}.pt")
                     print(f"  → new best {k} ({m[k]:.4f})")
+            # Select on the metric that actually reflects learning the edits.
+            ci = cm["change_mae_improvement"]
+            if np.isfinite(ci) and ci > best_change:
+                best_change = ci
+                torch.save(ckpt, out_dir / "best_change.pt")
+                print(f"  → new best change-ROI improvement ({ci:+.4f})")
 
         # ── visualisation ────────────────────────────────────────────────────
         if args.vis_every > 0 and epoch % args.vis_every == 0:
@@ -451,6 +522,12 @@ def main():
         beat = (best_metric[k] > baseline[k]) if hib else (best_metric[k] < baseline[k])
         print(f"{k.upper():>7}  {best_metric[k]:11.4f}  {baseline[k]:9.4f}  "
               f"{'BEATS identity' if beat else 'loses to identity'}")
+    # The headline for this branch: did the model reduce error where surgery
+    # actually changed the scan? (Whole-volume metrics above can't show it.)
+    print(f"\nBest change-ROI MAE improvement over identity (copy x_pre): "
+          f"{best_change:+.4f}  → checkpoint best_change.pt")
+    print("  (positive ⇒ the model genuinely edited the region of change, which is "
+          "the goal here; ~0 ⇒ it collapsed to copying x_pre.)")
     plot_progression(csv_log, out_dir, f"{out_dir.name} — Flow3D ({args.source})",
                      baseline=baseline)
     print(f"\nDone. Checkpoints in {out_dir}")

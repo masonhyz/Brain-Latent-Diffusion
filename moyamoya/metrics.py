@@ -109,6 +109,85 @@ def union_mask(x_pre, x_post):
     return (x_pre != 0) | (x_post != 0)
 
 
+def foreground_mask(*vols) -> np.ndarray:
+    """Brain (non-background) voxels — the *union* across the given volumes.
+
+    Both preprocessing conventions here put the background at a single constant
+    value: the minimum plateau with ``zero_background=False`` (the whole volume is
+    z-scored, so every out-of-brain voxel shares one value) and exact 0 with it on.
+    Either way the background is by far the most frequent *exact* value, so it is
+    detected per volume as the modal value and everything else is foreground. This
+    is robust to both conventions, unlike ``x != 0`` (which selects the whole
+    volume when the background is a nonzero plateau).
+    """
+    m = None
+    for v in vols:
+        a = _as_np(v).astype(np.float32)
+        vals, counts = np.unique(a, return_counts=True)
+        bg = vals[int(counts.argmax())]
+        fg = a != bg
+        m = fg if m is None else (m | fg)
+    return m
+
+
+def change_mask(x_pre, x_post, frac: float = 0.05, min_abs: float = 0.0,
+                brain=None) -> np.ndarray:
+    """The **region of change**: the top-``frac`` most-changed brain voxels.
+
+    Surgery alters the scan in a small, localised region; everywhere else
+    x_post ≈ x_pre and the identity/copy baseline is already perfect. That is
+    exactly why the whole-volume metrics are blind to whether a model learned the
+    edits — the changed region is a few percent of voxels, so nailing it barely
+    moves a mean taken over the whole volume (or, worse, over the ~71%-background
+    union). This ROI is where a model can actually beat identity, and the only
+    place worth scoring to answer "did it learn the substantial changes?".
+
+    Defined per subject as the brain voxels (see :func:`foreground_mask`) whose
+    ``|x_post − x_pre|`` is in the top ``frac`` fraction, optionally floored at an
+    absolute ``min_abs`` (z-score units). ``brain`` overrides the auto foreground.
+    """
+    xp = _as_np(x_pre).astype(np.float32)
+    xq = _as_np(x_post).astype(np.float32)
+    diff = np.abs(xq - xp)
+    brain = foreground_mask(x_pre, x_post) if brain is None else _as_np(brain).astype(bool)
+    d = diff[brain]
+    if d.size == 0:
+        return np.zeros(diff.shape, dtype=bool)
+    thr = max(float(np.quantile(d, 1.0 - frac)), float(min_abs))
+    return brain & (diff >= thr)
+
+
+def change_region_report(pred, x_pre, x_post, frac: float = 0.05,
+                         data_range: float | None = None) -> dict:
+    """Score ``pred`` against ``x_post`` **inside the region of change**, next to
+    what the identity baseline (copy x_pre) scores in the same ROI.
+
+    Returns model MAE/PSNR/SSIM over the change ROI, the identity baseline's ROI
+    MAE (= the mean edit magnitude the model has to explain — large by
+    construction), and ``change_mae_improvement`` = identity − model. A positive
+    improvement is the thing the whole-volume metrics cannot show: the model
+    genuinely reduced error where the surgery actually changed the scan. The ROI
+    is :func:`change_mask` (top ``frac`` most-changed brain voxels).
+    """
+    roi = change_mask(x_pre, x_post, frac=frac)
+    if roi.sum() == 0:
+        nan = float("nan")
+        return {"change_mae": nan, "change_psnr": nan, "change_ssim": nan,
+                "identity_change_mae": nan, "change_mae_improvement": nan,
+                "change_roi_frac": 0.0}
+    model = compute_metrics(pred,  x_post, roi, data_range=data_range)
+    ident = compute_metrics(x_pre, x_post, roi, data_range=data_range)
+    return {
+        "change_mae":  model["mae"],
+        "change_psnr": model["psnr"],
+        "change_ssim": model["ssim"],
+        "identity_change_mae": ident["mae"],
+        # >0 ⇒ the model beats copy-x_pre where it actually matters.
+        "change_mae_improvement": ident["mae"] - model["mae"],
+        "change_roi_frac": float(roi.mean()),
+    }
+
+
 def identity_baseline(pairs, mask_fn=tissue_mask, **kw) -> dict:
     """Metrics of the trivial predictor ``x_post := x_pre``, averaged over ``pairs``.
 
