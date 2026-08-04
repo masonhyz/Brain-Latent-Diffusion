@@ -151,6 +151,26 @@ def change_weight_map(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Adversarial detail term (hinge-GAN)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def d_hinge_loss(real_logits: torch.Tensor, fake_logits: torch.Tensor) -> torch.Tensor:
+    """Discriminator hinge loss — push real logits ≥ +1 and fake logits ≤ −1.
+
+    The hinge form (Lim & Ye 2017 / Miyato 2018) is the stable default for
+    spectral-normalised GANs: once a patch is confidently correct it stops
+    contributing gradient, which keeps the discriminator from running away on a
+    small dataset.
+    """
+    return torch.relu(1.0 - real_logits).mean() + torch.relu(1.0 + fake_logits).mean()
+
+
+def g_hinge_loss(fake_logits: torch.Tensor) -> torch.Tensor:
+    """Generator hinge loss — raise the discriminator's score on the fakes."""
+    return -fake_logits.mean()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # EMA
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -350,6 +370,25 @@ class ConditionalFlowMatching3D(nn.Module):
     def forward(self, x_post: torch.Tensor, x_pre: torch.Tensor) -> torch.Tensor:
         return self.flow_loss(x_post, x_pre)
 
+    # ── adversarial detail term ──────────────────────────────────────────────
+
+    def onestep_prediction(self, x_pre: torch.Tensor) -> torch.Tensor:
+        """One Euler step from t=0: x̂_post = x_pre + v_θ(x_pre, 0 | x_pre).
+
+        The cheapest *differentiable* estimate of x_post, and the right image to
+        hand a discriminator. The interpolant estimate x̂₁ = x_t + (1−t)·v used by
+        the SSIM term is ≈ x_post as t→1 — a trivially-real "fake" that would
+        destabilise the GAN — whereas this is a genuine prediction at every stage
+        of training and is exactly the first step the sampler takes, so pushing it
+        to look real sharpens the trajectory itself. Bridge only (``source="pre"``).
+        """
+        if self.source != "pre":
+            raise ValueError("onestep_prediction is only defined for source='pre'")
+        t0 = torch.zeros(x_pre.size(0), device=x_pre.device)
+        net_in = torch.cat([x_pre, x_pre], dim=1) if self.condition == "concat" else x_pre
+        v = self.net(net_in, t0 * self.time_scale)
+        return x_pre + v
+
     # ── sampling ─────────────────────────────────────────────────────────────
 
     def _velocity(
@@ -475,6 +514,54 @@ class ConditionalFlowMatching3D(nn.Module):
             steps = kwargs["ddim_steps"]
         return self.sample(x_pre, steps=steps, solver=solver,
                            guidance_scale=guidance_scale, init_noise=init_noise)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conditional 3D PatchGAN discriminator (for the adversarial detail term)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PatchDiscriminator3D(nn.Module):
+    """Conditional 3D PatchGAN, spectral-normalised.
+
+    Judges realism *locally*: strided convs shrink the volume to a grid of logits,
+    one per receptive-field patch, so the adversarial gradient rewards realistic
+    high-frequency texture patch-by-patch rather than making one global real/fake
+    call — the property that makes PatchGANs sharpen fine detail (Isola et al.
+    2017, pix2pix). It is conditioned on x_pre by channel concatenation, so it
+    scores "is this a plausible post-op volume *for this pre-op input*", pushing
+    the plausibility of the surgical edit and not mere image realism.
+
+    Spectral norm on every conv bounds the Lipschitz constant — the main thing
+    keeping a GAN stable on ~200 volumes — and is the only normalisation, to avoid
+    interacting with a second one. Deliberately shallow/narrow for the data size.
+    """
+
+    def __init__(self, in_channels: int = 2, dim: int = 32, n_layers: int = 3):
+        super().__init__()
+        sn = nn.utils.spectral_norm
+        layers = [sn(nn.Conv3d(in_channels, dim, 4, stride=2, padding=1)),
+                  nn.LeakyReLU(0.2, inplace=True)]
+        ch = dim
+        for _ in range(1, n_layers):                       # more stride-2 blocks
+            nch = min(ch * 2, dim * 8)
+            layers += [sn(nn.Conv3d(ch, nch, 4, stride=2, padding=1)),
+                       nn.LeakyReLU(0.2, inplace=True)]
+            ch = nch
+        nch = min(ch * 2, dim * 8)                          # stride-1 head → logits
+        layers += [sn(nn.Conv3d(ch, nch, 4, stride=1, padding=1)),
+                   nn.LeakyReLU(0.2, inplace=True),
+                   sn(nn.Conv3d(nch, 1, 4, stride=1, padding=1))]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x_pre: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
+        """(x_pre, img) → patch logits. Both (B,1,D,H,W); concatenated to 2 ch."""
+        return self.net(torch.cat([x_pre, img], dim=1))
+
+
+def build_discriminator3d(dim: int = 32, n_layers: int = 3,
+                          in_channels: int = 2) -> PatchDiscriminator3D:
+    """Build the conditional 3D PatchGAN for the adversarial detail term."""
+    return PatchDiscriminator3D(in_channels=in_channels, dim=dim, n_layers=n_layers)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

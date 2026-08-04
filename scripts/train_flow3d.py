@@ -33,7 +33,9 @@ from moyamoya.data import build_loaders
 from moyamoya.metrics import (
     change_region_report, compute_metrics, identity_baseline, union_mask,
 )
-from moyamoya.models.flow3d import EMA, build_flow3d
+from moyamoya.models.flow3d import (
+    EMA, build_discriminator3d, build_flow3d, d_hinge_loss, g_hinge_loss,
+)
 from moyamoya.runlog import (
     MetricsCSV, init_wandb, install_run_logger, plot_progression, save_grid,
     save_hparams, wandb_finish, wandb_log, wandb_log_image,
@@ -121,6 +123,25 @@ def get_args():
                         "change-region ROI reported at validation (change/* metrics). "
                         "This is where a model can actually beat identity; the "
                         "whole-volume metrics are blind to it.")
+    # ── adversarial detail term (the anti-blur fix) ──────────────────────────
+    p.add_argument("--adv_weight", type=float, default=0.0,
+                   help="Weight of the adversarial (hinge PatchGAN) term on the "
+                        "one-step prediction. 0 = off (pure regression). The CFM "
+                        "regression stays the dominant loss and anchors structure; "
+                        "the discriminator only adds high-frequency detail on top, "
+                        "so keep this small (try 0.05). Bridge only (--source pre).")
+    p.add_argument("--adv_lr", type=float, default=2e-4,
+                   help="Discriminator learning rate (its own AdamW).")
+    p.add_argument("--adv_warmup_epochs", type=int, default=25,
+                   help="Train the generator on CFM alone for this many epochs "
+                        "before switching the adversarial term on, so it edits a "
+                        "coherent structure rather than fighting a discriminator "
+                        "from noise. Only matters when --adv_weight > 0.")
+    p.add_argument("--disc_dim",    type=int, default=32,
+                   help="Base channel width of the PatchGAN discriminator.")
+    p.add_argument("--disc_layers", type=int, default=3,
+                   help="Number of stride-2 blocks in the discriminator (receptive "
+                        "field / patch size). More = larger patches, coarser.")
     p.add_argument("--l1_weight",   type=float, default=0.0,
                    help="Weight of an L1 term on the velocity residual (added to MSE)")
     p.add_argument("--ssim_weight", type=float, default=0.0,
@@ -370,13 +391,34 @@ def main():
     opt = torch.optim.AdamW(model.net.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)
 
+    # ── adversarial detail term (optional) ─────────────────────────────────────
+    # A conditional PatchGAN discriminator judges the one-step prediction
+    # x_pre+v(x_pre,0) against the real x_post. It fights the mode-averaging blur
+    # that a pure regression loss produces — the reason a change-weighted MSE still
+    # only made timid, smeared edits. The CFM regression stays dominant and keeps
+    # the output faithful; the discriminator only adds high-frequency detail.
+    disc = opt_d = None
+    if args.adv_weight > 0.0:
+        if args.source != "pre":
+            raise SystemExit("--adv_weight > 0 requires --source pre (the adversarial "
+                             "term scores the bridge's one-step prediction).")
+        disc = build_discriminator3d(dim=args.disc_dim, n_layers=args.disc_layers).to(device)
+        opt_d = torch.optim.AdamW(disc.parameters(), lr=args.adv_lr,
+                                  betas=(0.5, 0.9), weight_decay=0.0)
+        n_d = sum(p.numel() for p in disc.parameters())
+        print(f"[adversarial] hinge PatchGAN ON: weight={args.adv_weight} "
+              f"lr={args.adv_lr} warmup={args.adv_warmup_epochs}ep | "
+              f"disc params: {n_d:,} (dim={args.disc_dim}, layers={args.disc_layers})")
+        print("  ! adds a 2nd generator forward + a discriminator per step; if it "
+              "OOMs, lower --batch_size or --dim (A6000 is fine at bs2).")
+
     val_steps = args.val_steps or args.steps
     nfe = {"euler": 1, "heun": 2, "rk4": 4}[args.solver] * val_steps
     print(f"  Metrics every {args.metric_every} epoch(s): {val_steps} {args.solver} "
           f"steps = {nfe} NFE per sample (DDIM baseline was 50)")
 
     csv_log = MetricsCSV(out_dir / "metrics.csv",
-                         ["epoch", "lr", "train_loss", "val_loss",
+                         ["epoch", "lr", "train_loss", "g_adv", "d_loss", "val_loss",
                           "mae", "mse", "psnr", "ssim",
                           "change_mae", "identity_change_mae",
                           "change_mae_improvement", "change_psnr", "change_ssim"])
@@ -391,6 +433,7 @@ def main():
     def checkpoint():
         return {"model": model.net.state_dict(),
                 "ema":   ema_model.net.state_dict(),
+                "disc":  disc.state_dict() if disc is not None else None,
                 "args":  vars(args),
                 "identity_baseline": baseline}
 
@@ -401,21 +444,56 @@ def main():
             g["lr"] = lr
 
         model.train()
-        tr_loss = 0.0
+        if disc is not None:
+            disc.train()
+        tr_loss = tr_adv = tr_d = 0.0
+        # Let the generator learn a coherent coarse mapping before the
+        # discriminator starts pushing on it (see --adv_warmup_epochs).
+        adv_on = disc is not None and epoch > args.adv_warmup_epochs
+
+        def _ac():
+            return torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                  enabled=args.amp)
+
         for x, y in train_dl:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
-                                enabled=args.amp):
-                loss = model.flow_loss(x_post=y, x_pre=x)
-            loss.backward()
+
+            # ── generator: CFM regression (always the dominant term) ──────────
+            opt.zero_grad(set_to_none=True)
+            with _ac():
+                loss_cfm = model.flow_loss(x_post=y, x_pre=x)
+            loss_cfm.backward()                       # frees the CFM graph
+            tr_loss += loss_cfm.item()
+
+            # ── adversarial detail term (after warmup) ───────────────────────
+            if adv_on:
+                with _ac():
+                    x1 = model.onestep_prediction(x)          # differentiable fake
+                # discriminator step: real x_post vs the detached prediction
+                with _ac():
+                    loss_d = d_hinge_loss(disc(x, y).float(),
+                                          disc(x, x1.detach()).float())
+                opt_d.zero_grad(set_to_none=True)
+                loss_d.backward()
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(disc.parameters(), args.grad_clip)
+                opt_d.step()
+                tr_d += loss_d.item()
+                # generator adversarial gradient — reuse x1's graph (D just stepped),
+                # accumulated into the same opt as the CFM grads above.
+                with _ac():
+                    g_adv = g_hinge_loss(disc(x, x1).float())
+                (args.adv_weight * g_adv).backward()
+                tr_adv += g_adv.item()
+
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.net.parameters(), args.grad_clip)
             opt.step()
-            opt.zero_grad(set_to_none=True)
             ema.update(ema_model.net, model.net)
-            tr_loss += loss.item()
-        tr_loss /= max(len(train_dl), 1)
+        nb = max(len(train_dl), 1)
+        tr_loss /= nb; tr_adv /= nb; tr_d /= nb
+        adv_str = f"  adv={tr_adv:+.3f} d={tr_d:.3f}" if adv_on else ""
 
         # ── validation ───────────────────────────────────────────────────────
         do_metrics = (args.metric_every <= 1
@@ -442,7 +520,7 @@ def main():
                 ("+" if ((m[k] > baseline[k]) if hib else (m[k] < baseline[k])) else "-")
                 for k, hib in METRIC_HIGHER_BETTER.items())
             print(f"Epoch {epoch:4d}/{args.epochs}  lr={lr:.2e}  "
-                  f"train={tr_loss:.4f}  val={val_loss:.4f}  "
+                  f"train={tr_loss:.4f}{adv_str}  val={val_loss:.4f}  "
                   f"MAE={m['mae']:.4f}  MSE={m['mse']:.4f}  "
                   f"PSNR={m['psnr']:.2f}  SSIM={m['ssim']:.4f}  "
                   f"[vs identity: {flags}]")
@@ -455,11 +533,16 @@ def main():
                   f"PSNR={cm['change_psnr']:.2f}  SSIM={cm['change_ssim']:.4f}")
         else:
             print(f"Epoch {epoch:4d}/{args.epochs}  lr={lr:.2e}  "
-                  f"train={tr_loss:.4f}  val={val_loss:.4f}")
+                  f"train={tr_loss:.4f}{adv_str}  val={val_loss:.4f}")
 
         csv_log.append({"epoch": epoch, "lr": lr, "train_loss": tr_loss,
+                        "g_adv": tr_adv, "d_loss": tr_d,
                         "val_loss": val_loss, **m, **cm})
         log = {"train_loss": tr_loss, "val_loss": val_loss, "lr": lr}
+        if disc is not None:
+            log["adv/g_adv"] = tr_adv
+            log["adv/d_loss"] = tr_d
+            log["adv/on"] = float(adv_on)
         if do_metrics:
             log.update(m)
             # Overlay the identity baseline as a constant and log the signed
