@@ -4,8 +4,16 @@ Flow3D training — conditional flow matching for paired pre→post CBF predicti
 Single stage, image space, no autoencoder. See moyamoya/models/flow3d.py for
 why the default transports x_pre → x_post rather than noise → x_post.
 
-    # default: bridge from the pre-op volume (recommended)
+    # default: bridge from the pre-op volume
     python scripts/train_flow3d.py --out_dir runs/flow3d
+
+    # RECOMMENDED (2026-08-05 change-detection rework): factorise WHERE (a
+    # supervised change-localisation gate) from WHAT (the residual), and regress
+    # the change at the scales where it is predictable. See the change-signal
+    # diagnosis — the top-few-% change is ~half unpredictable registration noise,
+    # so a plain/re-weighted MSE either collapses to identity or blurs.
+    python scripts/train_flow3d.py --gated --det_weight 0.3 --ms_weights 1 1 1 \
+        --change_weight 0 --edge_downweight 0.3 --wandb_group flow3d_change_detect
 
     # ablation: standard CFM from Gaussian noise, same U-Net, for a like-for-like
     # comparison against the diffusion models
@@ -14,7 +22,8 @@ why the default transports x_pre → x_post rather than noise → x_post.
 
 Every run prints, and plots, the identity baseline (predict x_post := x_pre) on
 its own validation split. On this dataset that baseline beats every diffusion
-model in the repo, so it is the number that matters.
+model in the repo, so it is the number that matters. The gated model additionally
+reports gate AUC / corr — whether it learned WHERE the scan actually changes.
 """
 
 import argparse
@@ -31,10 +40,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from moyamoya.data import build_loaders
 from moyamoya.metrics import (
-    change_region_report, compute_metrics, identity_baseline, union_mask,
+    change_region_report, compute_metrics, foreground_mask, identity_baseline,
+    union_mask,
 )
 from moyamoya.models.flow3d import (
-    EMA, build_discriminator3d, build_flow3d, d_hinge_loss, g_hinge_loss,
+    EMA, build_discriminator3d, build_flow3d, coherent_change_target,
+    d_hinge_loss, g_hinge_loss,
 )
 from moyamoya.runlog import (
     MetricsCSV, init_wandb, install_run_logger, plot_progression, save_grid,
@@ -110,7 +121,10 @@ def get_args():
                         "that actually differ between pre and post so the sparse "
                         "surgical edits are not averaged away by the near-identity "
                         "majority — the cause of the copy-x_pre collapse. 0 = plain "
-                        "MSE (ablation). Only applied for --source pre.")
+                        "MSE (ablation). Only applied for --source pre. NOTE: the "
+                        "coherent-change approach (--gated + --ms_weights) sets this "
+                        "to 0 — up-weighting the raw |Δ| tail chases registration "
+                        "noise (see the change-detection block below).")
     p.add_argument("--change_sampler_beta", type=float, default=0.0,
                    help="Oversample big-change subjects with a WeightedRandomSampler, "
                         "weight ∝ 1+beta*g/median(g) with g the subject's global "
@@ -118,6 +132,56 @@ def get_args():
                         "the per-voxel --change_weight is the safer primary lever; "
                         "this is the complementary coarse one (your 'focus on the "
                         "pairs that differ' idea).")
+    p.add_argument("--change_sampler_coherent", dest="change_sampler_coherent",
+                   action="store_true",
+                   help="Weight the change-emphasis sampler by *coherent* (Gaussian-"
+                        "smoothed) change, not raw |Δ|. Raw |Δ| is inflated by "
+                        "misregistration speckle, so oversampling on it partly "
+                        "oversamples the noisiest subjects; the coherent measure "
+                        "picks the subjects with big *real* edits. Only matters when "
+                        "--change_sampler_beta > 0.")
+    p.set_defaults(change_sampler_coherent=False)
+    # ── change-detection / coherent-change training (the 2026-08-05 rework) ────
+    # Diagnosis: the top-few-% change is ~half unpredictable registration/acquisition
+    # noise; the learnable part is the coherent, low-frequency, subject-specific edit.
+    # So: factorise WHERE (a supervised detection gate) from WHAT (a residual), and
+    # regress the change at the scales where it is predictable. Recommended run:
+    #   python scripts/train_flow3d.py --gated --det_weight 0.3 --ms_weights 1 1 1 \
+    #       --change_weight 0 --edge_downweight 0.3 --wandb_group flow3d_change_detect
+    p.add_argument("--gated", dest="gated", action="store_true",
+                   help="Factorise the velocity as gate·residual with a 2-channel "
+                        "backbone (GatedVelocityNet). The gate is a supervisable "
+                        "change-localisation map — the 'learn WHERE to edit' head. "
+                        "Pair with --det_weight; on its own (det_weight 0) the gate "
+                        "is unsupervised and this is just an ablation.")
+    p.set_defaults(gated=False)
+    p.add_argument("--det_weight", type=float, default=0.0,
+                   help="Weight of the change-detection loss: soft-Dice between the "
+                        "gate and the coherent-change target (smoothed-|Δ| region). "
+                        "The imbalance-robust 'learn WHERE' term the re-weighted MSE "
+                        "could not be. Requires --gated and --source pre. 0 = off. "
+                        "Try 0.3 (comparable in magnitude to the velocity regression "
+                        "early on; lower it if the residual stops learning magnitude, "
+                        "raise it if the gate stays diffuse).")
+    p.add_argument("--det_sigma", type=float, default=2.0,
+                   help="Gaussian sigma (voxels) defining the coherent-change region "
+                        "the gate is trained to detect. Larger = smoother/coarser.")
+    p.add_argument("--ms_weights", type=float, nargs="+", default=None,
+                   help="Per-scale weights for the multi-scale change loss on v vs "
+                        "u_t (each scale = one more x2 avg-pool = lower frequency). "
+                        "e.g. '1 1 1' scores full-res + 2 coarser scales, putting "
+                        "gradient on the coherent edit and away from the high-freq "
+                        "registration speckle a single-scale MSE chases. Unset = "
+                        "plain full-resolution MSE. Bridge only.")
+    p.add_argument("--edge_downweight", type=float, default=0.0,
+                   help="gamma for softly down-weighting the full-res regression on "
+                        "x_pre's structural edges (where misregistration fakes "
+                        "change; the change-ROI is 2.2x enriched there). 0 = off; "
+                        "try 0.3. Applied only at the full-resolution scale.")
+    p.add_argument("--gate_init_bias", type=float, default=-2.0,
+                   help="Initial bias of the gate logit (sigmoid(-2)~0.12), so the "
+                        "gate starts sparse — a sensible prior over a near-identity "
+                        "volume. Only used with --gated.")
     p.add_argument("--change_roi_frac", type=float, default=0.05,
                    help="Fraction of most-changed brain voxels that define the "
                         "change-region ROI reported at validation (change/* metrics). "
@@ -245,6 +309,39 @@ CHANGE_KEYS = ("change_mae", "change_psnr", "change_ssim",
                "identity_change_mae", "change_mae_improvement", "change_roi_frac")
 
 
+def save_gate_vis(x_pre_np, gate_np, target_np, title, path):
+    """3 orthogonal views × [pre-op | predicted gate | true coherent-change].
+
+    Lets you *see* whether the detection head fires where the scan actually
+    changes — the direct read on the "learn WHERE" objective, which the scalar
+    gate AUC only summarises. Gate/target are shown on a fixed 0…1 scale.
+    """
+    import matplotlib.pyplot as plt
+    a = np.asarray(x_pre_np).squeeze(); g = np.asarray(gate_np).squeeze()
+    t = np.asarray(target_np).squeeze()
+    D, H, W = a.shape
+    views = [("Axial", a[D // 2], g[D // 2], t[D // 2]),
+             ("Coronal", a[:, H // 2], g[:, H // 2], t[:, H // 2]),
+             ("Sagittal", a[:, :, W // 2], g[:, :, W // 2], t[:, :, W // 2])]
+    cols = ["Pre-surgery", "Predicted gate (WHERE)", "True coherent change"]
+    fig, axes = plt.subplots(3, 3, figsize=(10, 10), constrained_layout=True)
+    for r, (name, pa, pg, pt) in enumerate(views):
+        for c, (img, cmap, vmax) in enumerate([(pa, "gray", None),
+                                               (pg, "inferno", 1.0),
+                                               (pt, "inferno", 1.0)]):
+            ax = axes[r, c]
+            ax.imshow(img, cmap=cmap, origin="lower",
+                      vmin=0 if vmax else None, vmax=vmax)
+            ax.axis("off")
+            if r == 0:
+                ax.set_title(cols[c], fontsize=11)
+        axes[r, 0].set_ylabel(name, fontsize=10)
+    fig.suptitle(title, fontsize=12)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 @torch.no_grad()
 def evaluate(model, val_dl, device, args, steps: int):
     """Sampled predictions over the val split → (whole-volume, change-region) means.
@@ -256,11 +353,14 @@ def evaluate(model, val_dl, device, args, steps: int):
     """
     acc = {"mae": [], "mse": [], "psnr": [], "ssim": []}
     cacc = {k: [] for k in CHANGE_KEYS}
+    gated = getattr(model, "gated", False)
+    gate_corr, gate_auc = [], []
     for x, y in val_dl:
         x_d = x.to(device, non_blocking=True)
         pred = model.sample(x_d, steps=steps, solver=args.solver,
                             guidance_scale=args.guidance_scale,
                             init_noise=args.init_noise)
+        gmap = model.predict_change_map(x_d) if gated else None
         for i in range(x.shape[0]):
             p = pred[i].float().cpu()
             # Union (whole-volume) mask, exactly as train_ldm_7tcdm3d scores —
@@ -271,11 +371,47 @@ def evaluate(model, val_dl, device, args, steps: int):
             cm = change_region_report(p, x[i], y[i], frac=args.change_roi_frac)
             for k in cacc:
                 cacc[k].append(cm[k])
+            if gmap is not None:
+                gc, ga = _gate_quality(gmap[i], x[i], y[i], args.det_sigma,
+                                       args.change_roi_frac)
+                if np.isfinite(gc):
+                    gate_corr.append(gc)
+                if np.isfinite(ga):
+                    gate_auc.append(ga)
     whole  = {k: float(np.mean(v)) for k, v in acc.items()}
     # nanmean: a subject with an empty ROI (no change) contributes NaN, skip it.
     change = {k: (float(np.nanmean(v)) if len(v) else float("nan"))
               for k, v in cacc.items()}
+    change["gate_corr"] = float(np.mean(gate_corr)) if gate_corr else float("nan")
+    change["gate_auc"]  = float(np.mean(gate_auc))  if gate_auc  else float("nan")
     return whole, change
+
+
+def _gate_quality(gate, x_pre, x_post, det_sigma, roi_frac):
+    """How well the predicted gate localises the *true* coherent change (brain only).
+
+    Returns ``(pearson_corr, roc_auc)``:
+      * corr — Pearson r between the gate and the smoothed-|Δ| soft target,
+      * auc  — ROC-AUC of the gate as a detector of the top-``roi_frac`` coherent-
+        change voxels (0.5 = chance, 1.0 = perfect ranking of WHERE it changes).
+    Both restricted to brain voxels so the near-constant background can't inflate
+    them. This is the headline "did it learn WHERE" number.
+    """
+    g = gate.float().cpu().numpy().squeeze()
+    tgt = coherent_change_target(x_pre.unsqueeze(0), x_post.unsqueeze(0),
+                                 det_sigma)[0].numpy().squeeze()
+    fg = foreground_mask(x_pre, x_post)
+    gf, tf = g[fg], tgt[fg]
+    corr = float(np.corrcoef(gf, tf)[0, 1]) if gf.std() > 0 and tf.std() > 0 else float("nan")
+    # binary labels = top-frac coherent-change voxels; rank-based AUC via Mann-Whitney
+    thr = np.quantile(tf, 1.0 - roi_frac)
+    pos = gf[tf >= thr]; neg = gf[tf < thr]
+    if len(pos) == 0 or len(neg) == 0:
+        return corr, float("nan")
+    order = np.argsort(np.concatenate([pos, neg]), kind="mergesort")
+    ranks = np.empty_like(order, dtype=np.float64); ranks[order] = np.arange(1, len(order) + 1)
+    auc = (ranks[:len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg))
+    return corr, float(auc)
 
 
 def main():
@@ -358,7 +494,11 @@ def main():
         logit_mean=args.logit_mean, logit_std=args.logit_std,
         change_weight=args.change_weight,
         l1_weight=args.l1_weight, ssim_weight=args.ssim_weight,
-        cfg_drop_prob=args.cfg_drop_prob, steps=args.steps, solver=args.solver,
+        cfg_drop_prob=args.cfg_drop_prob,
+        gated=args.gated, det_weight=args.det_weight, det_sigma=args.det_sigma,
+        ms_weights=tuple(args.ms_weights) if args.ms_weights else None,
+        edge_downweight=args.edge_downweight, gate_init_bias=args.gate_init_bias,
+        steps=args.steps, solver=args.solver,
     ).to(device)
     # Record what --condition actually resolved to, so the checkpoint rebuilds
     # the right input width and hparams.json is not ambiguous.
@@ -376,6 +516,27 @@ def main():
         print(f"  ! --change_weight {args.change_weight} is ignored for --source noise "
               f"(there the target velocity is x_post−noise, not the change map). The "
               f"change weighting only applies to the bridge (--source pre).")
+
+    # ── change-detection guardrails ──────────────────────────────────────────
+    if args.gated and args.det_weight <= 0:
+        print("  ! --gated without --det_weight: the gate is architectural but "
+              "unsupervised, so it just absorbs into the residual. Set --det_weight "
+              "(try 0.3) to actually train the WHERE detector. Continuing as an ablation.")
+    if args.det_weight > 0 and not args.gated:
+        print(f"  ! --det_weight {args.det_weight} needs --gated (the detection loss "
+              f"scores the gate map, which only exists on a gated net). Ignored.")
+    if args.det_weight > 0 and args.source != "pre":
+        print(f"  ! --det_weight {args.det_weight} needs --source pre (the coherent-"
+              f"change target is x_post−x_pre). Ignored.")
+    if (args.gated or args.ms_weights) and args.change_weight > 0:
+        print(f"  ! coherent-change training with --change_weight {args.change_weight} "
+              f">0: the raw-|Δ| voxel weight up-weights the noisy edge tail, which is "
+              f"exactly what the multi-scale/detection terms exist to avoid. Consider "
+              f"--change_weight 0.")
+    if args.gated:
+        print(f"[gated] velocity = gate·residual | det_weight={args.det_weight} "
+              f"det_sigma={args.det_sigma} ms_weights={args.ms_weights} "
+              f"edge_downweight={args.edge_downweight}")
 
     # EMA copy, sampled from at validation time.
     ema_model = deepcopy(model).to(device).eval()
@@ -418,15 +579,18 @@ def main():
           f"steps = {nfe} NFE per sample (DDIM baseline was 50)")
 
     csv_log = MetricsCSV(out_dir / "metrics.csv",
-                         ["epoch", "lr", "train_loss", "g_adv", "d_loss", "val_loss",
+                         ["epoch", "lr", "train_loss", "reg_loss", "det_loss",
+                          "g_adv", "d_loss", "val_loss",
                           "mae", "mse", "psnr", "ssim",
                           "change_mae", "identity_change_mae",
-                          "change_mae_improvement", "change_psnr", "change_ssim"])
+                          "change_mae_improvement", "change_psnr", "change_ssim",
+                          "gate_corr", "gate_auc"])
     vis_dir = out_dir / "vis"
     vis_dir.mkdir(exist_ok=True)
 
     best_val = float("inf")
     best_change = float("-inf")   # best change-ROI improvement over identity
+    best_gate = float("-inf")     # best change-localisation AUC (gated model)
     best_metric = {k: (float("-inf") if hib else float("inf"))
                    for k, hib in METRIC_HIGHER_BETTER.items()}
 
@@ -446,7 +610,7 @@ def main():
         model.train()
         if disc is not None:
             disc.train()
-        tr_loss = tr_adv = tr_d = 0.0
+        tr_loss = tr_adv = tr_d = tr_reg = tr_det = 0.0
         # Let the generator learn a coherent coarse mapping before the
         # discriminator starts pushing on it (see --adv_warmup_epochs).
         adv_on = disc is not None and epoch > args.adv_warmup_epochs
@@ -462,9 +626,12 @@ def main():
             # ── generator: CFM regression (always the dominant term) ──────────
             opt.zero_grad(set_to_none=True)
             with _ac():
-                loss_cfm = model.flow_loss(x_post=y, x_pre=x)
+                loss_cfm, comp = model.flow_loss(x_post=y, x_pre=x,
+                                                 return_components=True)
             loss_cfm.backward()                       # frees the CFM graph
             tr_loss += loss_cfm.item()
+            tr_reg += comp.get("reg", float("nan"))
+            tr_det += comp.get("det", 0.0)
 
             # ── adversarial detail term (after warmup) ───────────────────────
             if adv_on:
@@ -492,8 +659,9 @@ def main():
             opt.step()
             ema.update(ema_model.net, model.net)
         nb = max(len(train_dl), 1)
-        tr_loss /= nb; tr_adv /= nb; tr_d /= nb
+        tr_loss /= nb; tr_adv /= nb; tr_d /= nb; tr_reg /= nb; tr_det /= nb
         adv_str = f"  adv={tr_adv:+.3f} d={tr_d:.3f}" if adv_on else ""
+        det_str = f"  det={tr_det:.3f}" if (args.gated and args.det_weight > 0) else ""
 
         # ── validation ───────────────────────────────────────────────────────
         do_metrics = (args.metric_every <= 1
@@ -513,32 +681,39 @@ def main():
         # Sampled metrics use the EMA weights — that is what eval/inference load.
         m, cm = (evaluate(ema_model, val_dl, device, args, val_steps) if do_metrics
                  else ({k: float("nan") for k in METRIC_HIGHER_BETTER},
-                       {k: float("nan") for k in CHANGE_KEYS}))
+                       {k: float("nan") for k in (*CHANGE_KEYS, "gate_corr", "gate_auc")}))
 
         if do_metrics:
             flags = "".join(
                 ("+" if ((m[k] > baseline[k]) if hib else (m[k] < baseline[k])) else "-")
                 for k, hib in METRIC_HIGHER_BETTER.items())
             print(f"Epoch {epoch:4d}/{args.epochs}  lr={lr:.2e}  "
-                  f"train={tr_loss:.4f}{adv_str}  val={val_loss:.4f}  "
+                  f"train={tr_loss:.4f}{det_str}{adv_str}  val={val_loss:.4f}  "
                   f"MAE={m['mae']:.4f}  MSE={m['mse']:.4f}  "
                   f"PSNR={m['psnr']:.2f}  SSIM={m['ssim']:.4f}  "
                   f"[vs identity: {flags}]")
             # The number the whole-volume metrics can't show: error in the region
             # that actually changed, and whether it beats copying x_pre there.
+            gate_str = (f"  |  gate AUC={cm['gate_auc']:.3f} corr={cm['gate_corr']:.3f}"
+                        if args.gated and np.isfinite(cm.get("gate_auc", float("nan")))
+                        else "")
             print(f"            change-ROI (top {args.change_roi_frac:.0%}): "
                   f"MAE={cm['change_mae']:.4f} vs identity {cm['identity_change_mae']:.4f} "
                   f"(Δ={cm['change_mae_improvement']:+.4f}, "
                   f"{'BEATS' if cm['change_mae_improvement'] > 0 else 'loses to'} identity)  "
-                  f"PSNR={cm['change_psnr']:.2f}  SSIM={cm['change_ssim']:.4f}")
+                  f"PSNR={cm['change_psnr']:.2f}  SSIM={cm['change_ssim']:.4f}{gate_str}")
         else:
             print(f"Epoch {epoch:4d}/{args.epochs}  lr={lr:.2e}  "
-                  f"train={tr_loss:.4f}{adv_str}  val={val_loss:.4f}")
+                  f"train={tr_loss:.4f}{det_str}{adv_str}  val={val_loss:.4f}")
 
         csv_log.append({"epoch": epoch, "lr": lr, "train_loss": tr_loss,
+                        "reg_loss": tr_reg, "det_loss": tr_det,
                         "g_adv": tr_adv, "d_loss": tr_d,
                         "val_loss": val_loss, **m, **cm})
         log = {"train_loss": tr_loss, "val_loss": val_loss, "lr": lr}
+        if args.gated and args.det_weight > 0:
+            log["train/reg"] = tr_reg
+            log["train/det"] = tr_det
         if disc is not None:
             log["adv/g_adv"] = tr_adv
             log["adv/d_loss"] = tr_d
@@ -563,6 +738,10 @@ def main():
             log["change/identity_mae"]  = cm["identity_change_mae"]
             log["change/mae_improvement"] = cm["change_mae_improvement"]
             log["change/roi_frac"]      = cm["change_roi_frac"]
+            # Detection head: did it learn WHERE the change is? (gated model only)
+            if args.gated and np.isfinite(cm.get("gate_auc", float("nan"))):
+                log["gate/auc"]  = cm["gate_auc"]
+                log["gate/corr"] = cm["gate_corr"]
         wandb_log(run, log, step=epoch)
 
         ckpt = checkpoint()
@@ -582,6 +761,12 @@ def main():
                 best_change = ci
                 torch.save(ckpt, out_dir / "best_change.pt")
                 print(f"  → new best change-ROI improvement ({ci:+.4f})")
+            # And on how well the gate localises WHERE the change is (gated model).
+            ga = cm.get("gate_auc", float("nan"))
+            if np.isfinite(ga) and ga > best_gate:
+                best_gate = ga
+                torch.save(ckpt, out_dir / "best_gate.pt")
+                print(f"  → new best gate AUC ({ga:.4f})")
 
         # ── visualisation ────────────────────────────────────────────────────
         if args.vis_every > 0 and epoch % args.vis_every == 0:
@@ -598,6 +783,19 @@ def main():
             print(f"  → saved visualisation: {path}")
             wandb_log_image(run, "val_sample", path, step=epoch)
 
+            # Gate panel: predicted change-localisation vs the true coherent change.
+            if args.gated:
+                with torch.no_grad():
+                    gate = ema_model.predict_change_map(xb)
+                tgt = coherent_change_target(x_v.unsqueeze(0), y_v.unsqueeze(0),
+                                             args.det_sigma)
+                gpath = vis_dir / f"epoch_{epoch:04d}_gate.png"
+                save_gate_vis(_to_np(x_v.unsqueeze(0)), gate[0].cpu().numpy(),
+                              tgt[0].cpu().numpy(),
+                              f"Flow3D gate (WHERE) — epoch {epoch}", gpath)
+                print(f"  → saved gate visualisation: {gpath}")
+                wandb_log_image(run, "val_gate", gpath, step=epoch)
+
     # ── wrap up ──────────────────────────────────────────────────────────────
     print("\n=== final vs identity baseline ===")
     print(f"{'metric':>7}  {'best model':>11}  {'identity':>9}  verdict")
@@ -611,6 +809,10 @@ def main():
           f"{best_change:+.4f}  → checkpoint best_change.pt")
     print("  (positive ⇒ the model genuinely edited the region of change, which is "
           "the goal here; ~0 ⇒ it collapsed to copying x_pre.)")
+    if args.gated:
+        print(f"Best change-localisation gate AUC: {best_gate:.4f}  → best_gate.pt")
+        print("  (0.5 ⇒ the gate is chance at finding WHERE the scan changes; "
+              "→1.0 ⇒ it localises the surgical edit. The 'learn where' headline.)")
     plot_progression(csv_log, out_dir, f"{out_dir.name} — Flow3D ({args.source})",
                      baseline=baseline)
     print(f"\nDone. Checkpoints in {out_dir}")

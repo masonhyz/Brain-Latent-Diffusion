@@ -138,7 +138,7 @@ def default_augmentation():
     return build_augmentation()
 
 
-def change_magnitudes(subset) -> np.ndarray:
+def change_magnitudes(subset, coherent: bool = False, sigma: float = 2.0) -> np.ndarray:
     """Per-subject global change ``mean|x_post − x_pre|`` over the brain, in order.
 
     Loads every volume in ``subset`` once (with the base normalising transform, no
@@ -147,17 +147,27 @@ def change_magnitudes(subset) -> np.ndarray:
     real change measure: under whole-volume normalisation the background is a
     near-constant plateau, so averaging over it would just add the same offset to
     every subject and wash out their differences.
+
+    ``coherent=True`` measures the *coherent* change instead: it Gaussian-blurs |Δ|
+    (σ voxels) before averaging, so the score reflects big *real* edits rather than
+    the high-frequency registration speckle that inflates raw |Δ|. This is the
+    sounder thing to oversample on — raw-|Δ| oversampling partly oversamples the
+    noisiest subjects (see the change-signal diagnosis).
     """
     from .metrics import foreground_mask
+    from .models.flow3d import gaussian_blur3d
     mags = []
     for x, y in subset:
         fg = foreground_mask(x, y)
-        d = (y - x).abs().numpy().squeeze()
+        d = (y - x).abs()
+        if coherent:
+            d = gaussian_blur3d(d.unsqueeze(0), sigma)[0]
+        d = d.numpy().squeeze()
         mags.append(float(d[fg].mean()) if fg.any() else 0.0)
     return np.asarray(mags, dtype=np.float64)
 
 
-def change_sampler(subset, beta: float):
+def change_sampler(subset, beta: float, coherent: bool = False):
     """A ``WeightedRandomSampler`` that oversamples the big-change subjects.
 
         weight_i ∝ 1 + β · (g_i / median g)
@@ -171,9 +181,12 @@ def change_sampler(subset, beta: float):
     (:func:`~moyamoya.models.flow3d.change_weight_map`) is the safer primary lever;
     this is the complementary coarse one.
 
+    ``coherent=True`` weights by the coherent (smoothed) change, not raw |Δ| — the
+    recommended measure, so the oversampling targets real edits not misregistration.
+
     Returns ``(sampler, g)`` — ``g`` is the change vector, for logging.
     """
-    g = change_magnitudes(subset)
+    g = change_magnitudes(subset, coherent=coherent)
     med = float(np.median(g))
     if med <= 0:
         med = float(g.mean()) if g.mean() > 0 else 1.0
@@ -220,14 +233,16 @@ def build_loaders(args, augment: bool = False):
     # not drowned out by the near-identity majority. Off unless --change_sampler_beta
     # > 0. Replaces shuffle (a sampler and shuffle=True are mutually exclusive).
     beta = float(getattr(args, "change_sampler_beta", 0.0) or 0.0)
+    coherent = bool(getattr(args, "change_sampler_coherent", False))
     sampler = None
     if beta > 0:
-        print(f"[change-sampler] computing per-subject change over {len(train_subset)} "
+        print(f"[change-sampler] computing per-subject "
+              f"{'coherent ' if coherent else ''}change over {len(train_subset)} "
               f"training volumes (one-time)...")
-        sampler, g = change_sampler(train_subset, beta)
-        print(f"[change-sampler] beta={beta}  global change: min={g.min():.3f} "
-              f"median={np.median(g):.3f} max={g.max():.3f} — oversampling "
-              f"large-change subjects (weight ∝ 1+beta·g/median).")
+        sampler, g = change_sampler(train_subset, beta, coherent=coherent)
+        print(f"[change-sampler] beta={beta} coherent={coherent}  global change: "
+              f"min={g.min():.3f} median={np.median(g):.3f} max={g.max():.3f} — "
+              f"oversampling large-change subjects (weight ∝ 1+beta·g/median).")
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size,
                           shuffle=(sampler is None), sampler=sampler,

@@ -82,6 +82,7 @@ masked (there it IS the source, and sampling starts from a full randn).
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .cdm3d import Unet3D_CDM, ssim3d_loss
 
@@ -151,6 +152,154 @@ def change_weight_map(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Coherent-change objective — the "learn where + learn the real detail" fix
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The empirical finding behind this whole block (measured on all 235 pairs):
+# the top-few-% "change" a subject actually undergoes is roughly HALF unpredictable
+# noise — ~60% high-frequency, 2.2× concentrated on x_pre's structural edges (a
+# misregistration signature, since pre/post are separate acquisitions), sign-balanced
+# and only weakly lateralised. The part a model *can* learn is the coherent,
+# low-frequency, subject-specific edit (an oracle smooth edit already removes ~62%
+# of the change-ROI error). So the objective must (a) supervise WHERE the change is
+# as an imbalance-robust detection problem, and (b) supervise WHAT changes at the
+# scales where it is predictable — instead of pouring MSE gradient into the noisy
+# voxel tail (change_weight_map's failure mode: it up-weights the least predictable
+# voxels) or synthesising plausible-but-wrong speckle (the adversarial risk).
+
+def gaussian_blur3d(x: torch.Tensor, sigma: float, truncate: float = 2.0) -> torch.Tensor:
+    """Separable 3-D Gaussian blur over the spatial dims of an (B,C,D,H,W) volume.
+
+    Three depthwise 1-D convolutions (one per axis), so cost is linear in the
+    kernel radius rather than cubic. ``sigma`` is in voxels; ``sigma<=0`` is a
+    no-op. Used to isolate the *coherent* (low-frequency) part of the change,
+    which is the part that is actually predictable from x_pre.
+    """
+    if not sigma or sigma <= 0:
+        return x
+    radius = max(1, int(truncate * float(sigma) + 0.5))
+    coords = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+    k = torch.exp(-(coords ** 2) / (2.0 * float(sigma) ** 2))
+    k = k / k.sum()
+    C = x.shape[1]
+    for ax in range(3):                                    # over D, H, W
+        ksz = [1, 1, 1]; ksz[ax] = k.numel()
+        kernel = k.view(1, 1, *ksz).repeat(C, 1, 1, 1, 1)
+        pad = [0, 0, 0]; pad[ax] = radius
+        x = F.conv3d(x, kernel, padding=tuple(pad), groups=C)
+    return x
+
+
+def coherent_change_target(
+    x_pre:  torch.Tensor,
+    x_post: torch.Tensor,
+    sigma:  float = 2.0,
+    q:      float = 0.995,
+    eps:    float = 1e-6,
+) -> torch.Tensor:
+    """Soft label in [0,1] marking WHERE the *coherent* change happens.
+
+        s = gaussian_blur(|x_post − x_pre|, sigma)   ← drop the high-freq noise
+        target = clamp(s / quantile(s, q), 0, 1)     ← per-sample soft occupancy
+
+    Blurring first is the whole point: the raw |Δ| tail is dominated by
+    edge/registration speckle, so a detector trained on it would chase noise; the
+    blurred field keeps only the spatially-coherent edit. No brain mask is needed —
+    both volumes share the same background plateau (and the same paired
+    augmentation), so Δ≈0 there and the target is already ≈0 off-brain. A pure
+    function of the data (no gradient). Shapes (B,C,D,H,W). Computed in fp32 (it
+    runs under bf16 autocast, and ``torch.quantile`` requires float/double).
+    """
+    # .float() AFTER the blur: the conv inside runs under bf16 autocast, and
+    # torch.quantile below rejects half/bf16.
+    s = gaussian_blur3d((x_post - x_pre).float().abs(), sigma).float()
+    flat = s.flatten(1)
+    scale = torch.quantile(flat, q, dim=1).clamp_min(eps)
+    scale = scale.view(-1, *([1] * (s.ndim - 1)))
+    return (s / scale).clamp(0.0, 1.0)
+
+
+def soft_dice_loss(p: torch.Tensor, target: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
+    """1 − soft Dice between a predicted map ``p``∈[0,1] and a soft ``target``∈[0,1].
+
+    The imbalance-robust localisation loss: Dice normalises by the size of the
+    predicted+target regions, so it is not swamped by the ~95% of voxels that do
+    not change — exactly the regime where a re-weighted MSE fails. Per-sample
+    reduction; ``eps`` (Laplace smoothing) keeps an all-zero target well-defined.
+    """
+    dims = tuple(range(1, p.ndim))
+    num = 2.0 * (p * target).sum(dims) + eps
+    den = (p + target).sum(dims) + eps
+    return (1.0 - num / den).mean()
+
+
+def edge_downweight_map(
+    x_pre: torch.Tensor,
+    gamma: float,
+    q:     float = 0.8,
+    floor: float = 0.1,
+    eps:   float = 1e-6,
+) -> torch.Tensor:
+    """Per-voxel weight in (0,1] that *down*-weights x_pre's high-gradient edges.
+
+        w = clamp(1 − γ·|∇x_pre|/quantile(|∇x_pre|, q), floor, 1)
+
+    The change-ROI is 2.2× enriched on structural edges, where a sub-voxel
+    pre/post misalignment manufactures large apparent change that no model can
+    predict. Softly discounting those voxels keeps the regression from being
+    dominated by registration artefacts. γ=0 returns all-ones. |∇| is a simple
+    first-difference magnitude; a pure function of x_pre (no gradient).
+    """
+    if gamma <= 0:
+        return torch.ones_like(x_pre)
+    xf = x_pre.float()                                  # fp32: quantile needs it
+    gm = torch.zeros_like(xf)
+    for ax in range(2, xf.ndim):
+        df = xf - torch.roll(xf, 1, dims=ax)
+        gm = gm + df * df
+    gm = gm.sqrt()
+    scale = torch.quantile(gm.flatten(1), q, dim=1).clamp_min(eps)
+    scale = scale.view(-1, *([1] * (xf.ndim - 1)))
+    w = (1.0 - gamma * (gm / scale)).clamp(floor, 1.0)
+    return w.to(x_pre.dtype)
+
+
+def multiscale_change_loss(
+    v:       torch.Tensor,
+    u:       torch.Tensor,
+    weights,
+    voxel_w: torch.Tensor = None,
+) -> torch.Tensor:
+    """Multi-scale MSE between predicted change ``v`` and target change ``u``.
+
+    ``weights[i]`` weights the residual after ``i`` successive ×2 average-pools, so
+    higher-index terms score progressively coarser (lower-frequency) structure —
+    the coherent, predictable part of the surgical edit. Averaging over a pooled
+    field is a low-pass filter, so the coarse terms are (near-)blind to the
+    high-frequency registration speckle that a single full-resolution MSE otherwise
+    chases. ``voxel_w`` (e.g. an edge down-weight) is applied at the full-resolution
+    scale only. Normalised by Σweights so the loss magnitude tracks a plain MSE.
+    ``weights=[1.0]`` recovers exactly ``(voxel_w·(v−u)²).mean()``.
+    """
+    total = v.new_zeros(())
+    norm = 0.0
+    cv, cu = v, u
+    for i, wt in enumerate(weights):
+        if wt > 0:
+            se = (cv - cu).pow(2)
+            if i == 0 and voxel_w is not None:
+                term = (voxel_w * se).mean()
+            else:
+                term = se.mean()
+            total = total + wt * term
+            norm += wt
+        if i < len(weights) - 1:
+            cv = F.avg_pool3d(cv, 2)
+            cu = F.avg_pool3d(cu, 2)
+    return total / max(norm, 1e-8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Adversarial detail term (hinge-GAN)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -205,6 +354,45 @@ class EMA:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gated-residual velocity — the "learn WHERE, then WHAT" factorisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GatedVelocityNet(nn.Module):
+    """Wrap a 2-output-channel backbone into a gated-residual velocity field.
+
+        (gate_logit, residual) = backbone(x, t)
+        gate = sigmoid(gate_logit)                 ← WHERE to edit, in [0,1]
+        v    = gate · residual                     ← WHAT edit, only where gate>0
+
+    The factorisation is the point. For the bridge the velocity *is* the change
+    field (u_t = x_post − x_pre), so multiplying a localisation map into a residual
+    forces the network to first decide *where* this subject changes and to return
+    ~0 (identity) everywhere else — instead of smearing a timid edit across the
+    whole brain, the mode-averaging failure of a plain regression. The gate is a
+    genuine, supervisable change-detector (see :func:`coherent_change_target`): even
+    when the residual's fine detail is uncertain, a crisp gate still edits the right
+    place at the right extent, which is exactly the "learn when and where" ask.
+
+    ``forward`` returns just the velocity, so this is a drop-in for the plain net
+    in the sampler and the one-step head; :meth:`gate_velocity` also returns the
+    gate for the detection loss and for visualisation.
+    """
+
+    def __init__(self, backbone: nn.Module):
+        super().__init__()
+        self.backbone = backbone
+
+    def gate_velocity(self, x: torch.Tensor, t: torch.Tensor):
+        out = self.backbone(x, t)
+        gate = torch.sigmoid(out[:, 0:1])
+        res = out[:, 1:2]
+        return gate, gate * res
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.gate_velocity(x, t)[1]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Conditional flow matching wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -246,6 +434,24 @@ class ConditionalFlowMatching3D(nn.Module):
             and x_post. See :meth:`flow_loss`.
         cfg_drop_prob: probability of zeroing the conditioning channel, for
             classifier-free guidance. Only coherent for ``source="noise"``.
+        gated: if the ``net`` is a :class:`GatedVelocityNet`, its output is a gated
+            residual v = gate·residual and the gate is a supervisable change
+            detector (see ``det_weight``). Set automatically by the factory.
+        det_weight: weight of the change-detection loss — a soft-Dice between the
+            gate map and :func:`coherent_change_target` (the *coherent*,
+            low-frequency change region). This is the "learn WHERE" term; it is the
+            imbalance-robust localisation loss the re-weighted MSE could not be.
+            Requires a gated net and source="pre". 0 = off.
+        det_sigma: Gaussian σ (voxels) that defines the coherent-change target the
+            detector is trained on. Larger = smoother/coarser change region.
+        ms_weights: per-scale weights for :func:`multiscale_change_loss` on the
+            change field (v vs u_t). ``None`` or ``[1.0]`` = plain full-resolution
+            MSE. Extra coarse scales (e.g. ``[1,1,1]``) put gradient on the coherent
+            edit and away from the high-frequency registration speckle — the
+            "learn the real detail" term. Bridge only.
+        edge_downweight: γ for :func:`edge_downweight_map`, softly discounting the
+            regression on x_pre's structural edges (where misregistration fakes
+            change). Applied at the full-resolution scale. 0 = off.
         time_scale: t is multiplied by this before the sinusoidal embedding, so
             a t ∈ [0,1] lands in the same numeric range the U-Net's embedding
             was designed for (integer timesteps 0…1000).
@@ -264,6 +470,11 @@ class ConditionalFlowMatching3D(nn.Module):
         l1_weight:     float = 0.0,
         ssim_weight:   float = 0.0,
         cfg_drop_prob: float = 0.0,
+        gated:         bool  = False,
+        det_weight:    float = 0.0,
+        det_sigma:     float = 2.0,
+        ms_weights:    tuple = None,
+        edge_downweight: float = 0.0,
         steps:         int   = 8,
         solver:        str   = "heun",
         time_scale:    float = 1000.0,
@@ -289,13 +500,19 @@ class ConditionalFlowMatching3D(nn.Module):
         self.l1_weight     = float(l1_weight)
         self.ssim_weight   = float(ssim_weight)
         self.cfg_drop_prob = float(cfg_drop_prob)
+        self.gated         = bool(gated)
+        self.det_weight    = float(det_weight)
+        self.det_sigma     = float(det_sigma)
+        self.ms_weights    = tuple(ms_weights) if ms_weights else None
+        self.edge_downweight = float(edge_downweight)
         self.steps         = int(steps)
         self.solver        = solver
         self.time_scale    = float(time_scale)
 
     # ── training ─────────────────────────────────────────────────────────────
 
-    def flow_loss(self, x_post: torch.Tensor, x_pre: torch.Tensor) -> torch.Tensor:
+    def flow_loss(self, x_post: torch.Tensor, x_pre: torch.Tensor,
+                  return_components: bool = False):
         """Conditional flow matching loss (official ConditionalFlowMatcher).
 
         Regresses v_θ onto the conditional velocity u_t = x1 - x0 of the Gaussian
@@ -304,11 +521,25 @@ class ConditionalFlowMatching3D(nn.Module):
         equivalence is the whole point of flow matching, and it is why the
         unobservable ε does not bias the result.
 
-        The squared (and optional L1) residual is weighted per voxel by
-        :func:`change_weight_map` (γ = ``self.change_weight``) so the sparse
-        surgical edits are not averaged away by the near-identity majority — the
-        cause of the copy-x_pre collapse. The weight averages to 1 per sample, so
-        with γ=0 this is exactly ``F.mse_loss(v, u_t)``.
+        On top of the base regression this method carries the coherent-change
+        objective (bridge only), each term optional:
+
+          * **multi-scale regression** (``ms_weights``) on the change field v vs u_t
+            — scores coarse (low-frequency) structure as well as full resolution, so
+            the gradient lands on the *predictable* coherent edit rather than the
+            high-frequency registration speckle a single-scale MSE chases.
+          * **edge down-weighting** (``edge_downweight``) — discounts the
+            full-resolution error on x_pre's structural edges, where a sub-voxel
+            pre/post misalignment fakes change.
+          * **change detection** (``det_weight``, gated net only) — a soft-Dice
+            between the gate map and :func:`coherent_change_target`, teaching the
+            network WHERE this subject changes as an imbalance-robust detection task.
+
+        With a plain net, ``ms_weights`` unset and ``change_weight`` the only knob,
+        this reduces exactly to the previous change-weighted MSE.
+
+        Returns the scalar loss, or ``(loss, components)`` with the per-term values
+        for logging when ``return_components``.
         """
         B, device = x_post.size(0), x_post.device
         t = sample_t(B, device, self.t_dist, self.logit_mean, self.logit_std)
@@ -338,23 +569,39 @@ class ConditionalFlowMatching3D(nn.Module):
         else:
             net_in = x_t
 
-        v = self.net(net_in, t * self.time_scale)
+        # Gated net also returns the change-localisation map for the detection term.
+        gate = None
+        if self.gated:
+            gate, v = self.net.gate_velocity(net_in, t * self.time_scale)
+        else:
+            v = self.net(net_in, t * self.time_scale)
 
-        # Change-weighted regression. w up-weights the voxels that actually differ
-        # between pre and post so the sparse edits are not averaged away by the
-        # near-identity majority (the copy-x_pre collapse). Only for the bridge,
-        # where Δ = x_post − x_pre is literally the target velocity; γ=0 or
-        # source="noise" fall back to the flat MSE. w averages to 1 per sample, so
-        # (w·se).mean() matches F.mse_loss(v, u_t) when γ=0.
-        w = (change_weight_map(x_pre, x_post, self.change_weight)
-             if (self.change_weight > 0.0 and self.source == "pre") else None)
+        # ── regression on the change field (v vs u_t) ─────────────────────────
+        # Per-voxel full-resolution weight = edge down-weight × change-weight (both
+        # optional). change_weight_map is kept for backward compatibility but the
+        # coherent-change model leaves it at 0 — up-weighting the raw |Δ| tail is
+        # what made the old model chase noise; the multi-scale terms are the fix.
+        bridge = self.source == "pre"
+        voxel_w = None
+        if bridge and self.edge_downweight > 0.0:
+            voxel_w = edge_downweight_map(x_pre, self.edge_downweight)
+        if bridge and self.change_weight > 0.0:
+            cw = change_weight_map(x_pre, x_post, self.change_weight)
+            voxel_w = cw if voxel_w is None else voxel_w * cw
 
-        diff = v - u_t
-        se = diff.pow(2)
-        loss = se.mean() if w is None else (w * se).mean()
+        if self.ms_weights:
+            reg = multiscale_change_loss(v, u_t, self.ms_weights, voxel_w)
+        else:
+            se = (v - u_t).pow(2)
+            reg = se.mean() if voxel_w is None else (voxel_w * se).mean()
+        loss = reg
+        comp = {"reg": float(reg.detach())}
+
         if self.l1_weight > 0.0:
-            ae = diff.abs()
-            loss = loss + self.l1_weight * (ae.mean() if w is None else (w * ae).mean())
+            ae = (v - u_t).abs()
+            l1 = ae.mean() if voxel_w is None else (voxel_w * ae).mean()
+            loss = loss + self.l1_weight * l1
+            comp["l1"] = float(l1.detach())
 
         if self.ssim_weight > 0.0:
             # x̂₁ from a single Euler step to t=1: x_t + (1-t)·v. This is the
@@ -363,9 +610,18 @@ class ConditionalFlowMatching3D(nn.Module):
             # a velocity. Exact when the path is straight, which for the bridge
             # it very nearly is.
             x1_hat = x_t + (1.0 - tb) * v
-            loss = loss + self.ssim_weight * ssim3d_loss(x1_hat, x_post)
+            s = ssim3d_loss(x1_hat, x_post)
+            loss = loss + self.ssim_weight * s
+            comp["ssim"] = float(s.detach())
 
-        return loss
+        # ── change detection (learn WHERE) ────────────────────────────────────
+        if bridge and self.gated and self.det_weight > 0.0:
+            target = coherent_change_target(x_pre, x_post, self.det_sigma)
+            det = soft_dice_loss(gate.float(), target)
+            loss = loss + self.det_weight * det
+            comp["det"] = float(det.detach())
+
+        return (loss, comp) if return_components else loss
 
     def forward(self, x_post: torch.Tensor, x_pre: torch.Tensor) -> torch.Tensor:
         return self.flow_loss(x_post, x_pre)
@@ -388,6 +644,23 @@ class ConditionalFlowMatching3D(nn.Module):
         net_in = torch.cat([x_pre, x_pre], dim=1) if self.condition == "concat" else x_pre
         v = self.net(net_in, t0 * self.time_scale)
         return x_pre + v
+
+    @torch.no_grad()
+    def predict_change_map(self, x_pre: torch.Tensor) -> torch.Tensor:
+        """The gate at t=0: the model's prediction of WHERE this subject changes.
+
+        For a gated net this is ``sigmoid(gate_logit)`` evaluated with x_t=x_pre —
+        the honest "from the pre-op scan alone, where will surgery alter the
+        perfusion" map, and the localisation used at the first sampling step. Useful
+        for visual/quantitative validation of the detection head. Returns ``None``
+        for a non-gated model (no explicit gate exists).
+        """
+        if not self.gated:
+            return None
+        t0 = torch.zeros(x_pre.size(0), device=x_pre.device)
+        net_in = torch.cat([x_pre, x_pre], dim=1) if self.condition == "concat" else x_pre
+        gate, _ = self.net.gate_velocity(net_in, t0 * self.time_scale)
+        return gate
 
     # ── sampling ─────────────────────────────────────────────────────────────
 
@@ -586,6 +859,12 @@ def build_flow3d(
     l1_weight:        float = 0.0,
     ssim_weight:      float = 0.0,
     cfg_drop_prob:    float = 0.0,
+    gated:            bool  = False,
+    det_weight:       float = 0.0,
+    det_sigma:        float = 2.0,
+    ms_weights:       tuple = None,
+    edge_downweight:  float = 0.0,
+    gate_init_bias:   float = -2.0,
     steps:            int   = 8,
     solver:           str   = "heun",
 ) -> ConditionalFlowMatching3D:
@@ -599,15 +878,21 @@ def build_flow3d(
     ``condition="concat"`` is the default for both sources: the network is
     conditioned on x_pre. This is what makes training descend (see the module
     docstring); ``condition="none"`` is kept only for ablation.
+
+    ``gated=True`` gives the backbone a second output channel and wraps it in a
+    :class:`GatedVelocityNet` (v = gate·residual), so the model factorises WHERE it
+    edits (the supervisable gate) from WHAT it edits (the residual). The gate is
+    then trained by the ``det_weight`` detection loss.
     """
     if condition is None:
         condition = "concat"
 
-    net = Unet3D_CDM(
+    in_ch = 2 if condition == "concat" else 1
+    backbone = Unet3D_CDM(
         dim=dim,
         dim_mults=dim_mults,
-        in_channels=2 if condition == "concat" else 1,
-        out_channels=1,
+        in_channels=in_ch,
+        out_channels=2 if gated else 1,        # (gate_logit, residual) when gated
         init_kernel_size=init_kernel_size,
         resnet_groups=resnet_groups,
     )
@@ -616,11 +901,19 @@ def build_flow3d(
         # Zero the final 1×1×1 conv so v_θ ≡ 0 at initialisation. For the bridge
         # this makes the untrained model return exactly x_pre — training starts
         # at the identity baseline instead of at noise, and the first gradient
-        # steps only ever have to explain the residual.
-        last = net.final_conv0[-1]
+        # steps only ever have to explain the residual. For the gated net the
+        # residual channel is 0 (→ v=0) regardless of the gate; the gate bias is
+        # set negative so the gate starts sparse (mostly "no change"), a sensible
+        # prior for a localisation map over a near-identity volume.
+        last = backbone.final_conv0[-1]
         nn.init.zeros_(last.weight)
         if last.bias is not None:
             nn.init.zeros_(last.bias)
+            if gated:
+                last.bias.data[0] = float(gate_init_bias)   # gate logit
+                last.bias.data[1] = 0.0                      # residual
+
+    net = GatedVelocityNet(backbone) if gated else backbone
 
     return ConditionalFlowMatching3D(
         net=net,
@@ -634,6 +927,11 @@ def build_flow3d(
         l1_weight=l1_weight,
         ssim_weight=ssim_weight,
         cfg_drop_prob=cfg_drop_prob,
+        gated=gated,
+        det_weight=det_weight,
+        det_sigma=det_sigma,
+        ms_weights=ms_weights,
+        edge_downweight=edge_downweight,
         steps=steps,
         solver=solver,
     )
@@ -644,7 +942,9 @@ def build_flow3d(
 _BUILD_KEYS = (
     "dim", "dim_mults", "init_kernel_size", "resnet_groups", "zero_init_out",
     "source", "condition", "sigma", "t_dist", "logit_mean", "logit_std",
-    "change_weight", "l1_weight", "ssim_weight", "cfg_drop_prob", "steps", "solver",
+    "change_weight", "l1_weight", "ssim_weight", "cfg_drop_prob",
+    "gated", "det_weight", "det_sigma", "ms_weights", "edge_downweight",
+    "steps", "solver",
 )
 
 
@@ -653,6 +953,8 @@ def build_from_args(args: dict, device="cpu") -> ConditionalFlowMatching3D:
     kw = {k: args[k] for k in _BUILD_KEYS if k in args}
     if "dim_mults" in kw:
         kw["dim_mults"] = tuple(kw["dim_mults"])
+    if kw.get("ms_weights"):
+        kw["ms_weights"] = tuple(kw["ms_weights"])
     # Checkpoints predating `condition` always concatenated x_pre.
     kw.setdefault("condition", "concat")
     # zero_init_out only affects initialisation; weights are loaded over it.
