@@ -199,46 +199,53 @@ def _style(ax):
     ax.set_axisbelow(True)
 
 
-def fig_trust_triage(rows, labels, out_path, budget):
-    """The killer figure: review the most-uncertain fraction, catch the failures.
+TRIAGE_SCORES = (("unc_mean", "ensemble variance (unc_mean)", C_MODEL),
+                 ("pred_change", "attempted-edit size (pred_change)", C_ALT))
 
-    Left — recall of true failures vs review budget for the primary score, one
-    line per failure definition, with the chance diagonal and the operating
-    point at ``budget`` marked. Right — mean MAE of the auto-accepted remainder
-    vs the same budget (uncertainty vs oracle vs random ordering).
+
+def fig_trust_triage(rows, worst, out_path, budget):
+    """The killer figure: review by a GT-free trust score, catch the failures.
+
+    Both deployment-valid scores are shown — the ensemble variance the paper is
+    about, and the attempted-edit size it largely proxies (they are strongly
+    rank-correlated; the edit size is the stronger subject-level flag). Left —
+    recall of the worst-``worst_frac`` predictions vs review budget, with the
+    chance diagonal and the operating point at ``budget`` marked. Right — mean
+    MAE of the auto-accepted remainder vs the same budget, with the true-error
+    oracle and random triage as bounds.
     """
     n = len(rows)
-    score = np.array([r[PRIMARY] for r in rows])
     mae = np.array([r["mae"] for r in rows])
-    order = np.argsort(-score, kind="stable")
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
 
     ax = axes[0]
     revs = np.arange(0, n + 1) / n
-    for si, ((name, y), color) in enumerate(zip(labels.items(),
-                                                (C_MODEL, C_ALT))):
-        if y.sum() == 0:
-            continue
-        caught = np.concatenate([[0], np.cumsum(y[order])]) / y.sum()
+    k = int(np.ceil(budget * n))
+    for si, (key, name, color) in enumerate(TRIAGE_SCORES):
+        score = np.array([r[key] for r in rows])
+        order = np.argsort(-score, kind="stable")
+        caught = np.concatenate([[0], np.cumsum(worst[order])]) / worst.sum()
         ax.plot(revs, caught, color=color, linewidth=2, label=name)
-        k = int(np.ceil(budget * n))
         ax.plot(k / n, caught[k], "o", color=color, markersize=8)
-        ax.annotate(f"{caught[k]:.0%} caught\nat {budget:.0%} review",
+        ax.annotate(f"{caught[k]:.0%} caught at {budget:.0%} review",
                     (k / n, caught[k]), textcoords="offset points",
-                    xytext=(12, -6 - 26 * si), fontsize=9, color=C_INK)
+                    xytext=(10, -4 - 14 * si), fontsize=9, color=C_INK)
     ax.plot([0, 1], [0, 1], color=C_RANDOM, linewidth=1.5, linestyle=":",
             label="random triage")
     ax.axvline(budget, color=C_RANDOM, linewidth=1, linestyle="--")
-    ax.set_xlabel("fraction of predictions sent for review\n(most uncertain first)")
+    ax.set_xlabel("fraction of predictions sent for review\n(highest score first)")
     ax.set_ylabel("fraction of true failures caught")
     ax.set_title("The model triages its own outputs", fontsize=11, color=C_INK)
     ax.legend(frameon=False, fontsize=9, loc="lower right")
     _style(ax)
 
     ax = axes[1]
-    rc = retention_curve(score, mae)
-    ax.plot(rc["fracs"], rc["by_uncertainty"], color=C_MODEL, linewidth=2,
-            label="triage by uncertainty")
+    for key, name, color in TRIAGE_SCORES:
+        score = np.array([r[key] for r in rows])
+        rc = retention_curve(score, mae)
+        ax.plot(rc["fracs"], rc["by_uncertainty"], color=color, linewidth=2,
+                label=f"triage by {name.split(' (')[0]}")
+    rc = retention_curve(mae, mae)
     ax.plot(rc["fracs"], rc["by_error"], color=C_ORACLE, linewidth=1.5,
             linestyle="--", label="oracle (triage by true error)")
     ax.plot(rc["fracs"], rc["random"], color=C_RANDOM, linewidth=1.5,
@@ -317,8 +324,8 @@ def fig_subject_scatter(rows, worst, out_path, rho, ci):
 def fig_qualitative(picked, out_path):
     """Mid-axial slices: pre / post / prediction / |error| / uncertainty.
 
-    Error and uncertainty share the magma sequential map with per-row scaling
-    (error's 99th percentile), so the co-localisation is judged within a row.
+    Error and uncertainty use the magma sequential map, each scaled to its own
+    99th percentile — the comparison is spatial pattern, not magnitude.
     """
     cols = ("pre-op", "post-op (truth)", "prediction (mean)",
             "|error| (smoothed)", "uncertainty (smoothed std)")
@@ -329,13 +336,16 @@ def fig_qualitative(picked, out_path):
         z = ex["x"].shape[0] // 2
         anat = [ex["x"][z], ex["y"][z], ex["mean"][z]]
         lo, hi = np.percentile(np.stack(anat), [1, 99])
-        vmax = np.percentile(ex["err_sm"][z], 99)
         for c, img in enumerate(anat + [ex["err_sm"][z], ex["std_sm"][z]]):
             ax = axes[r, c]
             if c < 3:
                 ax.imshow(img, cmap="gray", vmin=lo, vmax=hi)
             else:
-                ax.imshow(img, cmap="magma", vmin=0, vmax=vmax)
+                # Own 99th-percentile scale per map: std is several times
+                # smaller than error, and the claim is spatial co-localisation,
+                # not shared magnitude.
+                ax.imshow(img, cmap="magma", vmin=0,
+                          vmax=np.percentile(img, 99))
             ax.set_xticks([]); ax.set_yticks([])
             for s in ax.spines.values():
                 s.set_visible(False)
@@ -495,8 +505,6 @@ def main():
     k = max(1, int(np.ceil(args.worst_frac * len(rows))))
     worst = mae >= np.sort(mae)[-k]                # worst k by whole-volume MAE
     loses = mae > ident                            # loses to copy-x_pre
-    labels = {f"worst {args.worst_frac:.0%} by MAE": worst,
-              "loses to identity baseline": loses}
 
     # Subject-level trust signal, every candidate score.
     subj = {}
@@ -520,6 +528,15 @@ def main():
         f"recall_at_{args.budget:.0%}_worst":
             bootstrap_ci(lambda a, b: recall_at_budget(a, b, args.budget),
                          u, worst),
+    }
+    upc = np.array([r["pred_change"] for r in rows])
+    pred_change_ci = {
+        "spearman_vs_mae":
+            bootstrap_ci(lambda a, b: spearmanr(a, b).statistic, upc, mae),
+        "auroc_worst": bootstrap_ci(auroc, upc, worst),
+        f"recall_at_{args.budget:.0%}_worst":
+            bootstrap_ci(lambda a, b: recall_at_budget(a, b, args.budget),
+                         upc, worst),
     }
 
     vox = {k2: float(np.nanmean([r[k2] for r in rows]))
@@ -559,6 +576,9 @@ def main():
     print(f"\nPrimary ({PRIMARY}) 95% bootstrap CIs: "
           + "  ".join(f"{k2} [{v[0]:.3f}, {v[1]:.3f}]"
                       for k2, v in primary_ci.items()))
+    print("pred_change 95% bootstrap CIs: "
+          + "  ".join(f"{k2} [{v[0]:.3f}, {v[1]:.3f}]"
+                      for k2, v in pred_change_ci.items()))
 
     # ── outputs ──────────────────────────────────────────────────────────────
     with open(out_dir / "per_subject.csv", "w", newline="") as f:
@@ -586,13 +606,14 @@ def main():
         "subject_level": subj,
         "primary_score": PRIMARY,
         "primary_bootstrap_ci95": primary_ci,
+        "pred_change_bootstrap_ci95": pred_change_ci,
         "train_args": ck,
     }
     with open(out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
     if args.figs:
-        fig_trust_triage(rows, labels, out_dir / "fig_trust_triage.png",
+        fig_trust_triage(rows, worst, out_dir / "fig_trust_triage.png",
                          args.budget)
         fig_sparsification([e["sp_curve"] for e in extras],
                            [e["sp_curve_sm"] for e in extras],
