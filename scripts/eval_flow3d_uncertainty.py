@@ -343,14 +343,17 @@ def fig_qualitative(picked, out_path):
             if c < 3:
                 ax.imshow(img, cmap="gray", vmin=lo, vmax=hi)
             else:
-                # Brain-masked, own 99th-percentile scale per map: the std
-                # carries a constant off-brain floor (init noise the ~0
-                # background velocity never removes) and is several times
-                # smaller than the error — the claim is spatial
-                # co-localisation within the brain, not shared magnitude.
-                shown = np.where(fgz, img, 0.0)
-                vmax = np.percentile(img[fgz], 99) if fgz.any() else 1.0
-                ax.imshow(shown, cmap="magma", vmin=0, vmax=vmax)
+                # Brain-masked, per-map in-brain p2–p98 stretch: the std
+                # rides a large constant floor (init noise the ~0 background
+                # velocity never removes) and is several times smaller than
+                # the error, so a [0, p99] scale renders it flat — the claim
+                # is within-brain spatial co-localisation, not magnitude.
+                if fgz.any():
+                    vmin, vmax = np.percentile(img[fgz], [2, 98])
+                else:
+                    vmin, vmax = 0.0, 1.0
+                shown = np.where(fgz, img, vmin)
+                ax.imshow(shown, cmap="magma", vmin=vmin, vmax=vmax)
             ax.set_xticks([]); ax.set_yticks([])
             for s in ax.spines.values():
                 s.set_visible(False)
