@@ -57,7 +57,7 @@ from moyamoya.dataset import PrePostFMRI
 from moyamoya.metrics import (
     change_mask, compute_metrics, foreground_mask, union_mask,
 )
-from moyamoya.models.flow3d import load_flow3d_checkpoint
+from moyamoya.models.flow3d import gaussian_blur3d, load_flow3d_checkpoint
 from moyamoya.transform import ToChannelsFirstAndNormalize
 from moyamoya.uncertainty import (
     auroc, bootstrap_ci, recall_at_budget, retention_curve, sparsification,
@@ -69,7 +69,10 @@ from moyamoya.utils import get_device
 C_MODEL, C_ALT = "#2a78d6", "#eb6834"
 C_ORACLE, C_RANDOM, C_INK = "#6f6e66", "#a5a49b", "#3d3d3a"
 
-SCORES = ("unc_mean", "unc_p99", "unc_top1")
+# Subject-level trust scores, all computable at deployment (no ground truth):
+# three summaries of the ensemble std over the pre-op brain, plus pred_change —
+# the size of the edit the model attempted — as a non-ensemble comparison.
+SCORES = ("unc_mean", "unc_p99", "unc_top1", "pred_change")
 PRIMARY = "unc_mean"
 
 
@@ -135,6 +138,17 @@ def evaluate_subject(model, x, y, sid, args, steps):
     vox_spearman = float(spearmanr(s_fg, e_fg).statistic)
     sp = sparsification(e_fg, s_fg)
 
+    # The same at the coherent scale: raw |error| is roughly half high-frequency
+    # registration speckle (see the change-signal diagnosis) that no ensemble
+    # can rank, so also score error↔std after a σ=``--smooth_sigma`` Gaussian —
+    # co-localisation of the coherent error with the coherent uncertainty.
+    blur = lambda v: gaussian_blur3d(v[None, None], args.smooth_sigma)[0, 0]
+    err_sm, std_sm = blur(err), blur(std)
+    e_sm, s_sm = err_sm[fg].numpy(), std_sm[fg].numpy()
+    vox_pearson_sm = float(pearsonr(s_sm, e_sm).statistic)
+    vox_spearman_sm = float(spearmanr(s_sm, e_sm).statistic)
+    sp_sm = sparsification(e_sm, s_sm)
+
     # The change ROI — the top-5% most-changed brain voxels, where ~8× the
     # error density lives — is the hardest place for the signal to work.
     roi = torch.from_numpy(change_mask(x3, y3))
@@ -149,6 +163,10 @@ def evaluate_subject(model, x, y, sid, args, steps):
         "unc_mean": float(s_pre.mean()),
         "unc_p99": float(np.quantile(s_pre, 0.99)),
         "unc_top1": float(np.sort(s_pre)[-max(1, s_pre.size // 100):].mean()),
+        # Not an uncertainty: the size of the edit the model attempted. A
+        # GT-free competitor — if it flags failures as well as the ensemble
+        # std does, the variance adds nothing over "big edit = risky".
+        "pred_change": float((mean - x3).abs()[fg_pre].mean()),
     }
 
     row = {
@@ -160,10 +178,13 @@ def evaluate_subject(model, x, y, sid, args, steps):
         **scores,
         "vox_pearson": vox_pearson, "vox_spearman": vox_spearman,
         "vox_ause": sp["ause"], "vox_ause_random": sp["ause_random"],
+        "vox_pearson_sm": vox_pearson_sm, "vox_spearman_sm": vox_spearman_sm,
+        "vox_ause_sm": sp_sm["ause"], "vox_ause_random_sm": sp_sm["ause_random"],
         "roi_pearson": roi_pearson,
     }
-    extras = {"sp_curve": sp, "x": x3.numpy(), "y": y3.numpy(),
-              "mean": mean.numpy(), "err": err.numpy(), "std": std.numpy()}
+    extras = {"sp_curve": sp, "sp_curve_sm": sp_sm,
+              "x": x3.numpy(), "y": y3.numpy(), "mean": mean.numpy(),
+              "err_sm": err_sm.numpy(), "std_sm": std_sm.numpy()}
     return row, extras
 
 
@@ -234,30 +255,39 @@ def fig_trust_triage(rows, labels, out_path, budget):
     plt.close(fig)
 
 
-def fig_sparsification(curves, out_path):
-    """Voxel-level sparsification, averaged over subjects (shared frac grid)."""
-    fracs = curves[0]["fracs"]
-    cu = np.nanmean([c["by_uncertainty"] for c in curves], axis=0)
-    ce = np.nanmean([c["by_error"] for c in curves], axis=0)
-    ause = float(np.nanmean([c["ause"] for c in curves]))
-    ause_rand = float(np.nanmean([c["ause_random"] for c in curves]))
+def fig_sparsification(curves, curves_sm, smooth_sigma, out_path):
+    """Voxel-level sparsification, averaged over subjects (shared frac grid).
 
-    fig, ax = plt.subplots(figsize=(5.6, 4.2))
-    ax.plot(fracs, cu, color=C_MODEL, linewidth=2, label="remove by ensemble std")
-    ax.plot(fracs, ce, color=C_ORACLE, linewidth=1.5, linestyle="--",
-            label="oracle (remove by true error)")
-    ax.axhline(1.0, color=C_RANDOM, linewidth=1.5, linestyle=":",
-               label="random removal")
-    ax.fill_between(fracs, ce, cu, color=C_MODEL, alpha=0.12)
-    ax.annotate(f"AUSE = {ause:.3f}\n(random = {ause_rand:.3f})",
-                (0.45, 0.55), xycoords="axes fraction", fontsize=10, color=C_INK)
-    ax.set_xlabel("fraction of brain voxels removed (most uncertain first)")
-    ax.set_ylabel("relative MAE of remaining voxels")
-    ax.set_title("Where the ensemble disagrees is where it is wrong",
-                 fontsize=11, color=C_INK)
-    ax.legend(frameon=False, fontsize=9, loc="lower left")
-    _style(ax)
-    fig.tight_layout()
+    Two panels: raw per-voxel maps, and the σ-smoothed maps where the
+    registration speckle — unrankable by construction — is suppressed.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
+    panels = ((axes[0], curves, "raw voxels"),
+              (axes[1], curves_sm, f"coherent scale (σ={smooth_sigma:g} smooth)"))
+    for ax, cs, tag in panels:
+        fracs = cs[0]["fracs"]
+        cu = np.nanmean([c["by_uncertainty"] for c in cs], axis=0)
+        ce = np.nanmean([c["by_error"] for c in cs], axis=0)
+        ause = float(np.nanmean([c["ause"] for c in cs]))
+        ause_rand = float(np.nanmean([c["ause_random"] for c in cs]))
+        ax.plot(fracs, cu, color=C_MODEL, linewidth=2,
+                label="remove by ensemble std")
+        ax.plot(fracs, ce, color=C_ORACLE, linewidth=1.5, linestyle="--",
+                label="oracle (remove by true error)")
+        ax.axhline(1.0, color=C_RANDOM, linewidth=1.5, linestyle=":",
+                   label="random removal")
+        ax.fill_between(fracs, ce, cu, color=C_MODEL, alpha=0.12)
+        ax.annotate(f"AUSE = {ause:.3f}\n(random = {ause_rand:.3f})",
+                    (0.42, 0.6), xycoords="axes fraction", fontsize=10,
+                    color=C_INK)
+        ax.set_xlabel("fraction of brain voxels removed\n(most uncertain first)")
+        ax.set_title(tag, fontsize=11, color=C_INK)
+        _style(ax)
+    axes[0].set_ylabel("relative MAE of remaining voxels")
+    axes[0].legend(frameon=False, fontsize=9, loc="lower left")
+    fig.suptitle("Where the ensemble disagrees is where it is wrong",
+                 fontsize=12, color=C_INK)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
 
@@ -290,8 +320,8 @@ def fig_qualitative(picked, out_path):
     Error and uncertainty share the magma sequential map with per-row scaling
     (error's 99th percentile), so the co-localisation is judged within a row.
     """
-    cols = ("pre-op", "post-op (truth)", "prediction (mean)", "|error|",
-            "uncertainty (std)")
+    cols = ("pre-op", "post-op (truth)", "prediction (mean)",
+            "|error| (smoothed)", "uncertainty (smoothed std)")
     fig, axes = plt.subplots(len(picked), 5,
                              figsize=(12.5, 2.7 * len(picked)))
     axes = np.atleast_2d(axes)
@@ -299,8 +329,8 @@ def fig_qualitative(picked, out_path):
         z = ex["x"].shape[0] // 2
         anat = [ex["x"][z], ex["y"][z], ex["mean"][z]]
         lo, hi = np.percentile(np.stack(anat), [1, 99])
-        vmax = np.percentile(ex["err"][z], 99)
-        for c, img in enumerate(anat + [ex["err"][z], ex["std"][z]]):
+        vmax = np.percentile(ex["err_sm"][z], 99)
+        for c, img in enumerate(anat + [ex["err_sm"][z], ex["std_sm"][z]]):
             ax = axes[r, c]
             if c < 3:
                 ax.imshow(img, cmap="gray", vmin=lo, vmax=hi)
@@ -311,9 +341,11 @@ def fig_qualitative(picked, out_path):
                 s.set_visible(False)
             if r == 0:
                 ax.set_title(cols[c], fontsize=10, color=C_INK)
-        axes[r, 0].set_ylabel(f"{tag}\n{row['id']}\nr={row['vox_pearson']:.2f}",
-                              fontsize=9, color=C_INK)
-    fig.suptitle("Uncertainty co-localises with error (per-voxel Pearson r)",
+        axes[r, 0].set_ylabel(
+            f"{tag}\n{row['id']}\nr={row['vox_pearson_sm']:.2f}",
+            fontsize=9, color=C_INK)
+    fig.suptitle("Uncertainty co-localises with error "
+                 "(smoothed maps; per-voxel Pearson r at the coherent scale)",
                  fontsize=12, color=C_INK)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(out_path, dpi=180)
@@ -360,6 +392,9 @@ def main():
     p.add_argument("--no-ema",  dest="use_ema", action="store_false")
     p.set_defaults(use_ema=True)
     # trust-signal definitions
+    p.add_argument("--smooth_sigma", type=float, default=2.0,
+                   help="Gaussian σ (voxels) for the coherent-scale voxel "
+                        "analysis — matches the coherent-change target")
     p.add_argument("--worst_frac", type=float, default=0.15,
                    help="'Failure' = this fraction of subjects with worst MAE")
     p.add_argument("--budget", type=float, default=0.15,
@@ -489,7 +524,12 @@ def main():
 
     vox = {k2: float(np.nanmean([r[k2] for r in rows]))
            for k2 in ("vox_pearson", "vox_spearman", "vox_ause",
-                      "vox_ause_random", "roi_pearson")}
+                      "vox_ause_random", "vox_pearson_sm", "vox_spearman_sm",
+                      "vox_ause_sm", "vox_ause_random_sm", "roi_pearson")}
+    # Fraction of the oracle's achievable error-removal the ensemble ranking
+    # actually delivers (1 = perfect ranking, 0 = uninformative).
+    vox["rel_ause_gain"] = 1.0 - vox["vox_ause"] / vox["vox_ause_random"]
+    vox["rel_ause_gain_sm"] = 1.0 - vox["vox_ause_sm"] / vox["vox_ause_random_sm"]
 
     # ── report ───────────────────────────────────────────────────────────────
     print(f"\n=== {scope} — n={len(rows)}, K={args.n_samples}, "
@@ -499,8 +539,14 @@ def main():
           f"{ident.mean():.4f}  (wins {int((mae < ident).sum())}/{len(rows)})")
     print(f"\nVoxel level (brain): Pearson r={vox['vox_pearson']:.3f}  "
           f"Spearman={vox['vox_spearman']:.3f}  AUSE={vox['vox_ause']:.3f} "
-          f"(random={vox['vox_ause_random']:.3f})  change-ROI r="
-          f"{vox['roi_pearson']:.3f}")
+          f"(random={vox['vox_ause_random']:.3f}, gain "
+          f"{vox['rel_ause_gain']:.1%})  change-ROI r={vox['roi_pearson']:.3f}")
+    print(f"  coherent scale (σ={args.smooth_sigma:g}): "
+          f"Pearson r={vox['vox_pearson_sm']:.3f}  "
+          f"Spearman={vox['vox_spearman_sm']:.3f}  "
+          f"AUSE={vox['vox_ause_sm']:.3f} "
+          f"(random={vox['vox_ause_random_sm']:.3f}, gain "
+          f"{vox['rel_ause_gain_sm']:.1%})")
     print(f"\nSubject level ({len(rows)} subjects, {int(worst.sum())} worst-"
           f"{args.worst_frac:.0%} failures, {int(loses.sum())} lose to identity):")
     print(f"{'score':>10} {'ρ(U,MAE)':>9} {'AUROC-worst':>12} "
@@ -526,7 +572,8 @@ def main():
         "n_subjects": len(rows),
         "ensemble": {"n_samples": args.n_samples, "init_noise": args.init_noise,
                      "solver": args.solver, "steps": steps,
-                     "chunk": args.chunk, "sample_seed": args.sample_seed},
+                     "chunk": args.chunk, "sample_seed": args.sample_seed,
+                     "smooth_sigma": args.smooth_sigma},
         "failure_defs": {"worst_frac": args.worst_frac,
                          "n_worst": int(worst.sum()),
                          "n_loses_identity": int(loses.sum()),
@@ -548,7 +595,8 @@ def main():
         fig_trust_triage(rows, labels, out_dir / "fig_trust_triage.png",
                          args.budget)
         fig_sparsification([e["sp_curve"] for e in extras],
-                           out_dir / "fig_sparsification.png")
+                           [e["sp_curve_sm"] for e in extras],
+                           args.smooth_sigma, out_dir / "fig_sparsification.png")
         rho = subj[PRIMARY]["spearman_vs_mae"]
         fig_subject_scatter(rows, worst, out_dir / "fig_subject_scatter.png",
                             rho, primary_ci["spearman_vs_mae"])
