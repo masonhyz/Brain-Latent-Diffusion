@@ -184,7 +184,8 @@ def evaluate_subject(model, x, y, sid, args, steps):
     }
     extras = {"sp_curve": sp, "sp_curve_sm": sp_sm,
               "x": x3.numpy(), "y": y3.numpy(), "mean": mean.numpy(),
-              "err_sm": err_sm.numpy(), "std_sm": std_sm.numpy()}
+              "err_sm": err_sm.numpy(), "std_sm": std_sm.numpy(),
+              "fg": fg.numpy()}
     return row, extras
 
 
@@ -336,16 +337,20 @@ def fig_qualitative(picked, out_path):
         z = ex["x"].shape[0] // 2
         anat = [ex["x"][z], ex["y"][z], ex["mean"][z]]
         lo, hi = np.percentile(np.stack(anat), [1, 99])
+        fgz = ex["fg"][z]
         for c, img in enumerate(anat + [ex["err_sm"][z], ex["std_sm"][z]]):
             ax = axes[r, c]
             if c < 3:
                 ax.imshow(img, cmap="gray", vmin=lo, vmax=hi)
             else:
-                # Own 99th-percentile scale per map: std is several times
-                # smaller than error, and the claim is spatial co-localisation,
-                # not shared magnitude.
-                ax.imshow(img, cmap="magma", vmin=0,
-                          vmax=np.percentile(img, 99))
+                # Brain-masked, own 99th-percentile scale per map: the std
+                # carries a constant off-brain floor (init noise the ~0
+                # background velocity never removes) and is several times
+                # smaller than the error — the claim is spatial
+                # co-localisation within the brain, not shared magnitude.
+                shown = np.where(fgz, img, 0.0)
+                vmax = np.percentile(img[fgz], 99) if fgz.any() else 1.0
+                ax.imshow(shown, cmap="magma", vmin=0, vmax=vmax)
             ax.set_xticks([]); ax.set_yticks([])
             for s in ax.spines.values():
                 s.set_visible(False)
