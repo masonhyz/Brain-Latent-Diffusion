@@ -1,9 +1,10 @@
 """Per-patient qualitative panels — a 3×5 grid for every subject.
 
-For each patient this renders three axial slices (rows) against the five
-columns pre-op / post-op / prediction (ensemble mean) / |error| / uncertainty
-(ensemble std), both maps smoothed to the coherent scale. It streams one figure
-per subject to ``<out_dir>/panels/<id>.png`` so the whole dataset fits in memory.
+For each patient this renders the three orthogonal views (axial, coronal,
+sagittal — rows) through the brain centre against the five columns pre-op /
+post-op / prediction (ensemble mean) / |error| / uncertainty (ensemble std),
+both maps smoothed to the coherent scale. It streams one figure per subject to
+``<out_dir>/panels/<id>.png`` so the whole dataset fits in memory.
 
 The uncertainty column deliberately does **not** share the error's colormap: it
 uses a calm, low-chroma cool ramp (``mild_unc``) while the error stays on the hot
@@ -79,59 +80,75 @@ def sample_ensemble(model, xb, args, steps, seed):
     return torch.cat(outs, 0)
 
 
-def pick_slices(fg3: np.ndarray, n: int) -> list:
-    """``n`` axial (z) indices spread across the brain's *well-covered* band.
+VIEWS = ("axial", "coronal", "sagittal")
 
-    The band is the run of slices whose brain area is at least half the peak
-    slice's — this deliberately drops the sparse skull-base / brainstem and
-    vertex caps, which a coverage-agnostic extent would otherwise treat as the
-    ends and place a montage slice on. Within that core band ``n`` interior
-    points are taken, so the rows are genuinely mid-brain cerebral slices,
-    roughly symmetric about the coverage peak.
+
+def brain_center(fg3: np.ndarray) -> tuple:
+    """Voxel centre of mass of the brain → ``(zc, yc, xc)`` ints.
+
+    The single point all three orthogonal planes pass through, so the montage
+    is a proper crosshair through the middle of the brain rather than three
+    independent slices.
     """
-    per_slice = fg3.reshape(fg3.shape[0], -1).sum(1).astype(float)
-    if per_slice.max() == 0:
-        mid = fg3.shape[0] // 2
-        return [mid] * n
-    core = np.where(per_slice >= 0.5 * per_slice.max())[0]
-    lo, hi = int(core.min()), int(core.max())
-    return [int(round(v)) for v in np.linspace(lo, hi, n + 2)[1:-1]]
+    pts = np.argwhere(fg3)
+    if pts.size == 0:
+        return tuple(sh // 2 for sh in fg3.shape)
+    return tuple(int(round(c)) for c in pts.mean(0))
 
 
-def render_patient(sid, x3, y3, mean, err_sm, std_sm, fg3, out_path, n_slices,
+def view_slice(vol: np.ndarray, view: str, center: tuple) -> np.ndarray:
+    """One orthogonal 2-D slice of a ``(Z, Y, X)`` volume, oriented superior-up.
+
+    axial = const Z → (Y, X); coronal = const Y → (Z, X); sagittal = const X →
+    (Z, Y). Coronal and sagittal are flipped along Z so the top of the head sits
+    at the top of the panel (array row 0 is the inferior-most slice otherwise).
+    """
+    zc, yc, xc = center
+    if view == "axial":
+        return vol[zc, :, :]
+    if view == "coronal":
+        return np.flipud(vol[:, yc, :])
+    return np.flipud(vol[:, :, xc])                     # sagittal
+
+
+def render_patient(sid, x3, y3, mean, err_sm, std_sm, fg3, out_path,
                    sampler_tag):
-    """One 3×5 grid (rows = slices, cols = pre/post/pred/|err|/unc) for a subject."""
-    zsel = pick_slices(fg3, n_slices)
+    """One 3×5 grid for a subject: rows = the three orthogonal views (axial /
+    coronal / sagittal) through the brain centre, cols = pre / post / prediction
+    / |error| / uncertainty."""
+    center = brain_center(fg3)
     cols = ("pre-op", "post-op (truth)", "prediction (mean)",
             "|error| (smoothed)", "uncertainty (smoothed std)")
+    row_lab = {"axial": f"axial (z={center[0]})",
+               "coronal": f"coronal (y={center[1]})",
+               "sagittal": f"sagittal (x={center[2]})"}
     # Stable anatomical window from the in-brain voxels of the three grey panels.
-    brain = fg3
-    anat_stack = np.stack([x3[brain], y3[brain], mean[brain]])
-    lo, hi = np.percentile(anat_stack, [1, 99])
+    lo, hi = np.percentile(np.concatenate([x3[fg3], y3[fg3], mean[fg3]]), [1, 99])
 
-    fig, axes = plt.subplots(n_slices, 5, figsize=(12.5, 2.7 * n_slices))
-    axes = np.atleast_2d(axes)
-    for r, z in enumerate(zsel):
-        fgz = fg3[z]
-        gr0, grx = np.percentile(err_sm[z][fgz], [2, 98]) if fgz.any() else (0, 1)
-        unc0, uncx = np.percentile(std_sm[z][fgz], [2, 98]) if fgz.any() else (0, 1)
-        panels = [(x3[z], "gray", lo, hi), (y3[z], "gray", lo, hi),
-                  (mean[z], "gray", lo, hi),
-                  (err_sm[z], CMAP_ERR, gr0, grx),
-                  (std_sm[z], CMAP_UNC, unc0, uncx)]
+    fig, axes = plt.subplots(3, 5, figsize=(12.5, 8.6))
+    for r, view in enumerate(VIEWS):
+        m = view_slice(fg3, view, center)
+        e = view_slice(err_sm, view, center)
+        u = view_slice(std_sm, view, center)
+        e0, e1 = np.percentile(e[m], [2, 98]) if m.any() else (0, 1)
+        u0, u1 = np.percentile(u[m], [2, 98]) if m.any() else (0, 1)
+        panels = [(view_slice(x3, view, center), "gray", lo, hi),
+                  (view_slice(y3, view, center), "gray", lo, hi),
+                  (view_slice(mean, view, center), "gray", lo, hi),
+                  (e, CMAP_ERR, e0, e1), (u, CMAP_UNC, u0, u1)]
         for c, (img, cmap, vmin, vmax) in enumerate(panels):
             ax = axes[r, c]
             if c < 3:
                 ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
             else:
-                ax.imshow(np.ma.masked_where(~fgz, img), cmap=cmap,
+                ax.imshow(np.ma.masked_where(~m, img), cmap=cmap,
                           vmin=vmin, vmax=max(vmax, vmin + 1e-6))
             ax.set_xticks([]); ax.set_yticks([])
             for s in ax.spines.values():
                 s.set_visible(False)
             if r == 0:
                 ax.set_title(cols[c], fontsize=10, color=C_INK)
-        axes[r, 0].set_ylabel(f"z = {z}", fontsize=9, color=C_INK)
+        axes[r, 0].set_ylabel(row_lab[view], fontsize=9, color=C_INK)
 
     mae = float(np.abs(mean - y3)[fg3].mean())
     imae = float(np.abs(x3 - y3)[fg3].mean())
@@ -166,7 +183,6 @@ def main():
                    choices=["euler", "heun", "rk4"])
     p.add_argument("--guidance_scale", type=float, default=None)
     p.add_argument("--sample_seed", type=int, default=0)
-    p.add_argument("--n_slices", type=int, default=3)
     p.add_argument("--smooth_sigma", type=float, default=2.0)
     p.add_argument("--use_ema", dest="use_ema", action="store_true")
     p.add_argument("--no-ema",  dest="use_ema", action="store_false")
@@ -206,7 +222,7 @@ def main():
                    f"outputs/uncertainty/{Path(args.ckpt).parent.name}{suffix}") / "panels"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Per-patient 3×{5} panels — {scope}, {len(indices)} subjects")
+    print(f"Per-patient orthogonal-view panels — {scope}, {len(indices)} subjects")
     print(f"  {sampler_tag}, steps={steps}, smooth σ={args.smooth_sigma}")
     print(f"  → {out_dir}\n")
 
@@ -225,7 +241,7 @@ def main():
         fg3 = foreground_mask(x3, y3)
         mae, imae = render_patient(sid, x3.numpy(), y3.numpy(), mean.numpy(),
                                    err_sm, std_sm, fg3, out_dir / f"{sid}.png",
-                                   args.n_slices, sampler_tag)
+                                   sampler_tag)
         if n % 10 == 0 or n == len(indices):
             print(f"  [{n}/{len(indices)}] {sid}  MAE={mae:.3f} (id {imae:.3f})")
 
