@@ -80,17 +80,21 @@ def sample_ensemble(model, xb, args, steps, seed):
 
 
 def pick_slices(fg3: np.ndarray, n: int) -> list:
-    """``n`` axial (z) indices evenly spanning the brain's z-extent.
+    """``n`` axial (z) indices spread across the brain's *well-covered* band.
 
-    Restricts to slices that actually contain brain, then takes ``n`` interior
-    points of that range so the top/bottom empty caps are skipped.
+    The band is the run of slices whose brain area is at least half the peak
+    slice's — this deliberately drops the sparse skull-base / brainstem and
+    vertex caps, which a coverage-agnostic extent would otherwise treat as the
+    ends and place a montage slice on. Within that core band ``n`` interior
+    points are taken, so the rows are genuinely mid-brain cerebral slices,
+    roughly symmetric about the coverage peak.
     """
-    per_slice = fg3.reshape(fg3.shape[0], -1).sum(1)
-    zs = np.where(per_slice > 0.01 * fg3[0].size)[0]
-    if zs.size == 0:
+    per_slice = fg3.reshape(fg3.shape[0], -1).sum(1).astype(float)
+    if per_slice.max() == 0:
         mid = fg3.shape[0] // 2
         return [mid] * n
-    lo, hi = int(zs.min()), int(zs.max())
+    core = np.where(per_slice >= 0.5 * per_slice.max())[0]
+    lo, hi = int(core.min()), int(core.max())
     return [int(round(v)) for v in np.linspace(lo, hi, n + 2)[1:-1]]
 
 
