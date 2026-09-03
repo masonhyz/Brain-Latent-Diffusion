@@ -1,0 +1,232 @@
+"""Per-patient qualitative panels — a 3×5 grid for every subject.
+
+For each patient this renders three axial slices (rows) against the five
+columns pre-op / post-op / prediction (ensemble mean) / |error| / uncertainty
+(ensemble std), both maps smoothed to the coherent scale. It streams one figure
+per subject to ``<out_dir>/panels/<id>.png`` so the whole dataset fits in memory.
+
+The uncertainty column deliberately does **not** share the error's colormap: it
+uses a calm, low-chroma cool ramp (``mild_unc``) while the error stays on the hot
+magma map, so the two read as different quantities at a glance rather than two
+copies of the same fiery gradient.
+
+    # every patient, SDE ensemble (the headline sampler)
+    python scripts/qual_panels_flow3d.py \
+        --ckpt runs/flow3d_2026-08-02_21-07-41/best_mae.pt --sampler sde
+
+    # just the held-out split, deterministic-ODE ensemble
+    python scripts/qual_panels_flow3d.py \
+        --ckpt runs/flow3d_2026-08-02_21-07-41/best_mae.pt --val_only --sampler ode
+"""
+
+import argparse
+import hashlib
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from matplotlib.colors import LinearSegmentedColormap
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from moyamoya.data import reconstruct_val_split
+from moyamoya.dataset import PrePostFMRI
+from moyamoya.metrics import foreground_mask
+from moyamoya.models.flow3d import gaussian_blur3d, load_flow3d_checkpoint
+from moyamoya.transform import ToChannelsFirstAndNormalize
+from moyamoya.utils import get_device
+
+C_INK = "#3d3d3a"
+
+# Error stays hot (magma); uncertainty gets its own calm, low-saturation cool
+# ramp so the two columns never look like the same gradient. Both mask the
+# off-brain background to black to sit cleanly on the figure.
+CMAP_ERR = plt.get_cmap("magma").copy()
+CMAP_ERR.set_bad("black")
+CMAP_UNC = LinearSegmentedColormap.from_list(
+    "mild_unc", ["#12212b", "#33546a", "#6893a6", "#a7c6d0", "#e3eef1"])
+CMAP_UNC.set_bad("black")
+
+
+def subject_seed(base: int, sid: str) -> int:
+    """Stable per-subject RNG seed (matches eval_flow3d_uncertainty), so a
+    subject's ensemble here is identical to the one the analysis reported."""
+    h = int(hashlib.sha1(sid.encode()).hexdigest()[:8], 16)
+    return (base + h) % (2 ** 31 - 1)
+
+
+@torch.no_grad()
+def sample_ensemble(model, xb, args, steps, seed):
+    """K trajectories → (K, D, H, W) fp32 CPU, batched ``chunk`` at a time."""
+    g = torch.Generator(device=xb.device).manual_seed(seed)
+    outs = []
+    for i in range(0, args.n_samples, args.chunk):
+        b = min(args.chunk, args.n_samples - i)
+        x = xb.repeat(b, 1, 1, 1, 1)
+        if args.sampler == "sde":
+            p = model.sample_sde(x, steps=steps,
+                                 gamma_scale=args.sde_gamma_scale,
+                                 guidance_scale=args.guidance_scale, generator=g)
+        else:
+            p = model.sample(x, steps=steps, solver=args.solver,
+                             guidance_scale=args.guidance_scale,
+                             init_noise=args.init_noise, generator=g)
+        outs.append(p.squeeze(1).float().cpu())
+    return torch.cat(outs, 0)
+
+
+def pick_slices(fg3: np.ndarray, n: int) -> list:
+    """``n`` axial (z) indices evenly spanning the brain's z-extent.
+
+    Restricts to slices that actually contain brain, then takes ``n`` interior
+    points of that range so the top/bottom empty caps are skipped.
+    """
+    per_slice = fg3.reshape(fg3.shape[0], -1).sum(1)
+    zs = np.where(per_slice > 0.01 * fg3[0].size)[0]
+    if zs.size == 0:
+        mid = fg3.shape[0] // 2
+        return [mid] * n
+    lo, hi = int(zs.min()), int(zs.max())
+    return [int(round(v)) for v in np.linspace(lo, hi, n + 2)[1:-1]]
+
+
+def render_patient(sid, x3, y3, mean, err_sm, std_sm, fg3, out_path, n_slices,
+                   sampler_tag):
+    """One 3×5 grid (rows = slices, cols = pre/post/pred/|err|/unc) for a subject."""
+    zsel = pick_slices(fg3, n_slices)
+    cols = ("pre-op", "post-op (truth)", "prediction (mean)",
+            "|error| (smoothed)", "uncertainty (smoothed std)")
+    # Stable anatomical window from the in-brain voxels of the three grey panels.
+    brain = fg3
+    anat_stack = np.stack([x3[brain], y3[brain], mean[brain]])
+    lo, hi = np.percentile(anat_stack, [1, 99])
+
+    fig, axes = plt.subplots(n_slices, 5, figsize=(12.5, 2.7 * n_slices))
+    axes = np.atleast_2d(axes)
+    for r, z in enumerate(zsel):
+        fgz = fg3[z]
+        gr0, grx = np.percentile(err_sm[z][fgz], [2, 98]) if fgz.any() else (0, 1)
+        unc0, uncx = np.percentile(std_sm[z][fgz], [2, 98]) if fgz.any() else (0, 1)
+        panels = [(x3[z], "gray", lo, hi), (y3[z], "gray", lo, hi),
+                  (mean[z], "gray", lo, hi),
+                  (err_sm[z], CMAP_ERR, gr0, grx),
+                  (std_sm[z], CMAP_UNC, unc0, uncx)]
+        for c, (img, cmap, vmin, vmax) in enumerate(panels):
+            ax = axes[r, c]
+            if c < 3:
+                ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
+            else:
+                ax.imshow(np.ma.masked_where(~fgz, img), cmap=cmap,
+                          vmin=vmin, vmax=max(vmax, vmin + 1e-6))
+            ax.set_xticks([]); ax.set_yticks([])
+            for s in ax.spines.values():
+                s.set_visible(False)
+            if r == 0:
+                ax.set_title(cols[c], fontsize=10, color=C_INK)
+        axes[r, 0].set_ylabel(f"z = {z}", fontsize=9, color=C_INK)
+
+    mae = float(np.abs(mean - y3)[fg3].mean())
+    imae = float(np.abs(x3 - y3)[fg3].mean())
+    fig.suptitle(f"{sid}   —   brain MAE {mae:.3f}  (identity {imae:.3f})   "
+                 f"[{sampler_tag}]", fontsize=12, color=C_INK)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+    return mae, imae
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_root",   type=str, default="fmri")
+    p.add_argument("--ckpt",        type=str, default="runs/flow3d/best_mae.pt")
+    p.add_argument("--out_dir",     type=str, default=None)
+    p.add_argument("--pre_dirname",  type=str, default="pre_surgery")
+    p.add_argument("--post_dirname", type=str, default="6_months_post_surgery")
+    p.add_argument("--val_only", action="store_true",
+                   help="Restrict to the checkpoint's held-out split "
+                        "(default: every patient in the dataset)")
+    p.add_argument("--limit", type=int, default=None)
+    # ensemble
+    p.add_argument("--sampler", type=str, default="sde", choices=["ode", "sde"])
+    p.add_argument("--sde_gamma_scale", type=float, default=1.0)
+    p.add_argument("--init_noise", type=float, default=0.1)
+    p.add_argument("--n_samples", type=int, default=20)
+    p.add_argument("--chunk", type=int, default=10)
+    p.add_argument("--steps", type=int, default=None,
+                   help="Default: 16 for sde, the checkpoint's value for ode")
+    p.add_argument("--solver", type=str, default=None,
+                   choices=["euler", "heun", "rk4"])
+    p.add_argument("--guidance_scale", type=float, default=None)
+    p.add_argument("--sample_seed", type=int, default=0)
+    p.add_argument("--n_slices", type=int, default=3)
+    p.add_argument("--smooth_sigma", type=float, default=2.0)
+    p.add_argument("--use_ema", dest="use_ema", action="store_true")
+    p.add_argument("--no-ema",  dest="use_ema", action="store_false")
+    p.set_defaults(use_ema=True)
+    args = p.parse_args()
+
+    args.device = get_device()
+    model, raw = load_flow3d_checkpoint(args.ckpt, device=args.device,
+                                        use_ema=args.use_ema)
+    ck = raw.get("args", {})
+    steps = args.steps or (16 if args.sampler == "sde" else ck.get("steps", 8))
+    args.solver = args.solver or ck.get("solver", "heun")
+    if args.guidance_scale is None:
+        args.guidance_scale = ck.get("guidance_scale", 1.0)
+    sampler_tag = (f"SDE γ={args.sde_gamma_scale}·σ², K={args.n_samples}"
+                   if args.sampler == "sde"
+                   else f"ODE init_noise={args.init_noise}, K={args.n_samples}")
+
+    zero_bg = ck.get("zero_background", False)
+    ds = PrePostFMRI(root_dir=args.data_root, pre_dirname=args.pre_dirname,
+                     post_dirname=args.post_dirname,
+                     transform=ToChannelsFirstAndNormalize(
+                         nonzero_mask=True, zero_background=zero_bg),
+                     strict=False, return_paths=True)
+    if args.val_only:
+        seed, vf = ck.get("seed", 42), ck.get("val_frac", 0.15)
+        _, val = reconstruct_val_split(ds, vf, seed, n_folds=ck.get("n_folds"),
+                                       fold=ck.get("fold"))
+        indices, scope = list(val.indices), "held-out validation split"
+    else:
+        indices, scope = list(range(len(ds))), "every patient"
+    if args.limit:
+        indices = indices[:args.limit]
+
+    suffix = "_sde" if args.sampler == "sde" else ""
+    out_dir = Path(args.out_dir or
+                   f"outputs/uncertainty/{Path(args.ckpt).parent.name}{suffix}") / "panels"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Per-patient 3×{5} panels — {scope}, {len(indices)} subjects")
+    print(f"  {sampler_tag}, steps={steps}, smooth σ={args.smooth_sigma}")
+    print(f"  → {out_dir}\n")
+
+    blur = lambda v: gaussian_blur3d(v[None, None], args.smooth_sigma)[0, 0]
+    for n, i in enumerate(indices, 1):
+        x, y, meta = ds[i]
+        sid = meta["id"]
+        xb = x.unsqueeze(0).to(args.device)
+        preds = sample_ensemble(model, xb, args, steps,
+                                subject_seed(args.sample_seed, sid))
+        mean = preds.mean(0)
+        std = preds.std(0, correction=1)
+        x3, y3 = x.squeeze(0), y.squeeze(0)
+        err_sm = blur((mean - y3).abs()).numpy()
+        std_sm = blur(std).numpy()
+        fg3 = foreground_mask(x3, y3)
+        mae, imae = render_patient(sid, x3.numpy(), y3.numpy(), mean.numpy(),
+                                   err_sm, std_sm, fg3, out_dir / f"{sid}.png",
+                                   args.n_slices, sampler_tag)
+        if n % 10 == 0 or n == len(indices):
+            print(f"  [{n}/{len(indices)}] {sid}  MAE={mae:.3f} (id {imae:.3f})")
+
+    print(f"\nDone — {len(indices)} panels in {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
