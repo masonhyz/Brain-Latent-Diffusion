@@ -84,22 +84,31 @@ def subject_seed(base: int, sid: str) -> int:
 
 
 @torch.no_grad()
-def sample_ensemble(model, x, n_samples, chunk, steps, solver, guidance,
-                    init_noise, seed):
-    """K perturbed-start trajectories for one subject → (K, D, H, W) fp32 CPU.
+def sample_ensemble(model, x, args, steps):
+    """K stochastic trajectories for one subject → (K, D, H, W) fp32 CPU.
 
-    Batches the ensemble ``chunk`` members at a time (one x_pre replicated along
-    the batch dim); a single per-subject generator makes the K draws distinct
-    and the whole ensemble reproducible.
+    ``--sampler ode`` integrates the deterministic ODE from an
+    ``--init_noise``-perturbed start (the tuned-knob ensemble); ``--sampler
+    sde`` samples the model's own probability path via the score-derived
+    Langevin SDE (see ``ConditionalFlowMatching3D.sample_sde``) — the trained σ
+    is the stochasticity, no knob. Batches ``chunk`` members at a time; a
+    single per-subject generator makes the K draws distinct and reproducible.
     """
-    g = torch.Generator(device=x.device).manual_seed(seed)
+    g = torch.Generator(device=x.device).manual_seed(
+        subject_seed(args.sample_seed, args._sid))
     outs = []
-    for i in range(0, n_samples, chunk):
-        b = min(chunk, n_samples - i)
+    for i in range(0, args.n_samples, args.chunk):
+        b = min(args.chunk, args.n_samples - i)
         xb = x.repeat(b, 1, 1, 1, 1)
-        p = model.sample(xb, steps=steps, solver=solver,
-                         guidance_scale=guidance, init_noise=init_noise,
-                         generator=g)
+        if args.sampler == "sde":
+            p = model.sample_sde(xb, steps=steps,
+                                 gamma_scale=args.sde_gamma_scale,
+                                 guidance_scale=args.guidance_scale,
+                                 generator=g)
+        else:
+            p = model.sample(xb, steps=steps, solver=args.solver,
+                             guidance_scale=args.guidance_scale,
+                             init_noise=args.init_noise, generator=g)
         outs.append(p.squeeze(1).float().cpu())
     return torch.cat(outs, 0)
 
@@ -112,9 +121,8 @@ def evaluate_subject(model, x, y, sid, args, steps):
     panel).
     """
     xb = x.unsqueeze(0).to(args.device)
-    preds = sample_ensemble(model, xb, args.n_samples, args.chunk, steps,
-                            args.solver, args.guidance_scale, args.init_noise,
-                            subject_seed(args.sample_seed, sid))
+    args._sid = sid
+    preds = sample_ensemble(model, xb, args, steps)
     mean = preds.mean(0)                                   # (D,H,W)
     std = preds.std(0, correction=1)
 
@@ -390,6 +398,13 @@ def main():
                    help="Evaluate only the first N subjects of the scope "
                         "(smoke tests)")
     # ensemble
+    p.add_argument("--sampler", type=str, default="ode", choices=["ode", "sde"],
+                   help="ode: deterministic ODE + init_noise perturbation. "
+                        "sde: score-derived Langevin SDE on the trained path "
+                        "(σ is the stochasticity; init_noise unused)")
+    p.add_argument("--sde_gamma_scale", type=float, default=1.0,
+                   help="γ = scale·σ² in the SDE churn term; 1 = unit "
+                        "relaxation over the run")
     p.add_argument("--n_samples",  type=int, default=16,
                    help="Ensemble members per subject")
     p.add_argument("--init_noise", type=float, default=None,
@@ -435,7 +450,9 @@ def main():
         args.init_noise = float(ck.get("sigma", 0.3))
 
     print(f"Checkpoint: {args.ckpt}  ({'EMA' if args.use_ema else 'online'} weights)")
-    print(f"Ensemble: K={args.n_samples} init_noise={args.init_noise} "
+    noise_desc = (f"gamma_scale={args.sde_gamma_scale} (σ={ck.get('sigma')})"
+                  if args.sampler == "sde" else f"init_noise={args.init_noise}")
+    print(f"Ensemble: sampler={args.sampler} K={args.n_samples} {noise_desc} "
           f"solver={args.solver} steps={steps} chunk={args.chunk} "
           f"device={args.device}")
 
@@ -458,8 +475,9 @@ def main():
         scope += f" [first {len(indices)}]"
     print(f"Scope: {scope} — {len(indices)} subjects\n")
 
+    suffix = "_sde" if args.sampler == "sde" else ""
     out_dir = Path(args.out_dir or
-                   f"outputs/uncertainty/{Path(args.ckpt).parent.name}")
+                   f"outputs/uncertainty/{Path(args.ckpt).parent.name}{suffix}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── sweep mode: pick the init_noise operating point ──────────────────────
@@ -558,7 +576,7 @@ def main():
 
     # ── report ───────────────────────────────────────────────────────────────
     print(f"\n=== {scope} — n={len(rows)}, K={args.n_samples}, "
-          f"init_noise={args.init_noise} ===")
+          f"sampler={args.sampler} ({noise_desc}) ===")
     print(f"MAE: ensemble mean {mae.mean():.4f}  single sample "
           f"{np.mean([r['mae_single'] for r in rows]):.4f}  identity "
           f"{ident.mean():.4f}  (wins {int((mae < ident).sum())}/{len(rows)})")
@@ -598,7 +616,11 @@ def main():
         "timestamp": datetime.now().isoformat(),
         "ckpt": args.ckpt, "use_ema": args.use_ema, "scope": scope,
         "n_subjects": len(rows),
-        "ensemble": {"n_samples": args.n_samples, "init_noise": args.init_noise,
+        "ensemble": {"sampler": args.sampler, "n_samples": args.n_samples,
+                     "init_noise": (None if args.sampler == "sde"
+                                    else args.init_noise),
+                     "sde_gamma_scale": (args.sde_gamma_scale
+                                         if args.sampler == "sde" else None),
                      "solver": args.solver, "steps": steps,
                      "chunk": args.chunk, "sample_seed": args.sample_seed,
                      "smooth_sigma": args.smooth_sigma},

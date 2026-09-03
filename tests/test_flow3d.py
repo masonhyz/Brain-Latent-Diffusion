@@ -67,6 +67,68 @@ def test_oracle_velocity_is_exact():
     print("  ok  oracle velocity integrates to x_post exactly (all solvers, 1-16 steps)")
 
 
+def test_sde_oracle_denoised_endpoint_is_exact():
+    """With the true (constant) velocity, the SDE's denoised endpoint must be
+    exactly x_post for every trajectory: the terminal state is x_post + path
+    noise, and the t=1 denoise x_pre + v removes it identically since v ≡ u.
+    Pins the score sign, the final denoise, and the brain masking at once."""
+    x_pre, x_post = _pair()
+    model = ConditionalFlowMatching3D(_OracleNet(x_pre, x_post).to(DEV),
+                                      source="pre", condition="none",
+                                      sigma=0.3).to(DEV)
+    brain = (x_pre != 0).float()
+    g = torch.Generator(device=DEV).manual_seed(0)
+    for gs in (0.0, 1.0, 2.0):
+        out = model.sample_sde(x_pre, steps=8, gamma_scale=gs, generator=g)
+        err = (out - x_post * brain).abs().max().item()
+        assert err < 1e-5, f"gamma_scale={gs}: denoised endpoint off by {err}"
+    print("  ok  SDE denoised endpoint is exactly x_post under the oracle velocity")
+
+
+def test_sde_marginal_width_matches_sigma():
+    """Under the oracle velocity the Langevin-corrected SDE must keep the
+    marginal at its stationary width: the pre-denoise terminal state is
+    x_post + σ·ε, so its per-voxel std across trajectories ≈ σ. A wrong score
+    scale (or a missing √(2γh)) shows up as a width far from σ."""
+    torch.manual_seed(0)
+    B, sigma = 256, 0.3
+    # One pair, replicated over the batch: every trajectory samples the same
+    # conditional, so the cross-batch spread is purely the path noise.
+    x_pre = (torch.randn(1, 1, 8, 8, 8, device=DEV).abs() + 0.5).repeat(B, 1, 1, 1, 1)
+    x_post = x_pre + 0.3 * torch.randn(1, 1, 8, 8, 8, device=DEV)
+    model = ConditionalFlowMatching3D(_OracleNet(x_pre, x_post).to(DEV),
+                                      source="pre", condition="none",
+                                      sigma=sigma).to(DEV)
+    g = torch.Generator(device=DEV).manual_seed(1)
+    _, traj = model.sample_sde(x_pre, steps=32, gamma_scale=1.0, generator=g,
+                               return_traj=True)
+    width = traj[-1].std(0).mean().item()          # pre-denoise terminal spread
+    assert abs(width - sigma) < 0.2 * sigma, (
+        f"terminal marginal width {width:.4f} should be ≈ σ={sigma}")
+    print(f"  ok  SDE terminal marginal width {width:.3f} ≈ σ={sigma}")
+
+
+def test_sde_reproducible_and_source_guard():
+    x_pre, x_post = _pair()
+    model = ConditionalFlowMatching3D(_OracleNet(x_pre, x_post).to(DEV),
+                                      source="pre", condition="none",
+                                      sigma=0.3).to(DEV)
+    a = model.sample_sde(x_pre, steps=4,
+                         generator=torch.Generator(device=DEV).manual_seed(7))
+    b = model.sample_sde(x_pre, steps=4,
+                         generator=torch.Generator(device=DEV).manual_seed(7))
+    assert torch.equal(a, b), "same generator seed must reproduce the sample"
+    noise_model = ConditionalFlowMatching3D(_OracleNet(x_pre, x_post).to(DEV),
+                                            source="noise", condition="concat",
+                                            sigma=0.3).to(DEV)
+    try:
+        noise_model.sample_sde(x_pre)
+        raise AssertionError("source='noise' must be rejected")
+    except ValueError:
+        pass
+    print("  ok  SDE reproducible under a seeded generator; bridge-only guard holds")
+
+
 def test_interpolant_endpoints_and_target():
     """The interpolant must start at x0, end at x1, and its clean velocity target
     must be x1 - x0 — the official ConditionalFlowMatcher path."""

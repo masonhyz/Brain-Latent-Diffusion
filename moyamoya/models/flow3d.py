@@ -769,6 +769,94 @@ class ConditionalFlowMatching3D(nn.Module):
             return (x, traj) if return_traj else x
 
     @torch.no_grad()
+    def sample_sde(
+        self,
+        x_pre:          torch.Tensor,
+        steps:          int   = None,
+        gamma_scale:    float = 1.0,
+        guidance_scale: float = 1.0,
+        generator:      torch.Generator = None,
+        return_traj:    bool  = False,
+    ) -> torch.Tensor:
+        """Stochastic sampling of the model's *own* probability path (bridge only).
+
+        The principled ensemble knob. The ODE in :meth:`sample` is deterministic,
+        so an ensemble needs an arbitrary ``init_noise`` perturbation; here the
+        stochasticity is the trained path's own σ instead. The model was trained
+        on the Gaussian path x_t = (1−t)·x_pre + t·x_post + σ·ε, whose score is
+        recoverable from the learned velocity (Gaussian-path identity, cf.
+        stochastic interpolants, Albergo & Vanden-Eijnden 2023):
+
+            E[x_post | x, t] = x_pre + v_θ(x, t)
+            E[μ_t   | x, t] = (1−t)·x_pre + t·E[x_post | x, t] = x_pre + t·v_θ
+            s_θ(x, t) = ∇ log p_t(x | x_pre) = −(x − x_pre − t·v_θ(x, t)) / σ²
+
+        Any Langevin-corrected SDE  dx = [v_θ + γ·s_θ] dt + √(2γ) dW  then shares
+        the ODE's time marginals p_t, for any γ ≥ 0 — the flow-matching analogue
+        of sampling a DDPM with different seeds. Concretely (Euler–Maruyama):
+
+            x(0) = x_pre + σ·ε          ← p_0 of the training path, not a knob
+            per step: x += h·(v + γ·s) + √(2γh)·ε,   γ = gamma_scale · σ²
+            return x_pre + v_θ(x(1), 1)  ← denoised endpoint, E[x_post | x(1)]
+
+        The final denoise matters: p_1 is the target *convolved with* N(0, σ²),
+        so the raw endpoint carries an additive σ floor that is path noise, not
+        predictive uncertainty; conditioning it out via the t=1 velocity leaves
+        the spread that comes from the velocity field responding differently
+        along different trajectories. ``gamma_scale=1`` (γ = σ²) relaxes toward
+        the path marginal with unit rate over the whole run — the natural
+        default; 0 recovers the ODE from a σ-perturbed start. NFE = steps + 1.
+
+        Bridge only (``source="pre"``): the score identity above needs the known
+        endpoint x_pre; for ``source="noise"`` E[x0 | x] is not recoverable from
+        u = x1 − x0 alone. Requires the σ > 0 the bridge is trained with anyway.
+        Noise is brain-masked exactly as the training σ·ε is.
+        """
+        if self.source != "pre":
+            raise ValueError("sample_sde is only defined for source='pre'")
+        if self.sigma <= 0:
+            raise ValueError("sample_sde needs the trained σ > 0 "
+                             "(the score is −residual/σ²)")
+        steps = int(steps or self.steps)
+
+        with torch.autocast(device_type=x_pre.device.type, enabled=False):
+            x_pre = x_pre.float()
+            device = x_pre.device
+            brain = (x_pre != 0).float()
+            sig2 = self.sigma ** 2
+            gamma = float(gamma_scale) * sig2
+            B = x_pre.shape[0]
+
+            def noise():
+                n = torch.randn(x_pre.shape, device=device, generator=generator,
+                                dtype=x_pre.dtype)
+                return n * brain
+
+            x = x_pre + self.sigma * noise()
+            zero_cond = torch.zeros_like(x_pre)
+            ts = torch.linspace(0.0, 1.0, steps + 1, device=device)
+            traj = [x.clone()] if return_traj else None
+
+            for i in range(steps):
+                t0, t1 = ts[i], ts[i + 1]
+                h = t1 - t0
+                v = self._velocity(x, t0.expand(B), x_pre, guidance_scale,
+                                   zero_cond)
+                if gamma > 0:
+                    score = -(x - x_pre - t0 * v) / sig2
+                    x = (x + h * (v + gamma * score)
+                         + torch.sqrt(2 * gamma * h) * noise())
+                else:
+                    x = x + h * v
+                if return_traj:
+                    traj.append(x.clone())
+
+            v1 = self._velocity(x, ts[-1].expand(B), x_pre, guidance_scale,
+                                zero_cond)
+            x = (x_pre + v1) * brain
+            return (x, traj) if return_traj else x
+
+    @torch.no_grad()
     def generate(
         self,
         x_pre:          torch.Tensor,
