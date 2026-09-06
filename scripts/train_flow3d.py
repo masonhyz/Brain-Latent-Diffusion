@@ -242,7 +242,12 @@ def report_gpu(device) -> None:
 
 
 CHANGE_KEYS = ("change_mae", "change_psnr", "change_ssim",
-               "identity_change_mae", "change_mae_improvement", "change_roi_frac")
+               "identity_change_mae", "change_mae_improvement", "change_roi_frac",
+               # noise-aware view: ~60% of the ROI is registration/acquisition
+               # noise, so report skill on the *coherent* (recoverable) edit and
+               # the noise floor next to the raw change numbers.
+               "coherent_frac", "roi_edge_enrichment", "coherent_change_mae",
+               "identity_coherent_change_mae", "coherent_change_improvement")
 
 
 @torch.no_grad()
@@ -421,7 +426,12 @@ def main():
                          ["epoch", "lr", "train_loss", "g_adv", "d_loss", "val_loss",
                           "mae", "mse", "psnr", "ssim",
                           "change_mae", "identity_change_mae",
-                          "change_mae_improvement", "change_psnr", "change_ssim"])
+                          "change_mae_improvement", "change_psnr", "change_ssim",
+                          "change_roi_frac",
+                          # noise-aware columns — the honest, paper-facing numbers
+                          "coherent_frac", "roi_edge_enrichment",
+                          "coherent_change_mae", "identity_coherent_change_mae",
+                          "coherent_change_improvement"])
     vis_dir = out_dir / "vis"
     vis_dir.mkdir(exist_ok=True)
 
@@ -531,6 +541,15 @@ def main():
                   f"(Δ={cm['change_mae_improvement']:+.4f}, "
                   f"{'BEATS' if cm['change_mae_improvement'] > 0 else 'loses to'} identity)  "
                   f"PSNR={cm['change_psnr']:.2f}  SSIM={cm['change_ssim']:.4f}")
+            # Honest, noise-aware line: only ~coherent_frac of that ROI is
+            # recoverable signal (the rest is registration/acq noise, edge-
+            # enriched ~roi_edge_enrichment×); coherent-Δ is skill on the part
+            # that is actually predictable. Report THIS in the paper.
+            print(f"              └ coherent {cm['coherent_frac']:.2f} of ROI "
+                  f"(edge-enrich {cm['roi_edge_enrichment']:.1f}×); coherent-MAE "
+                  f"{cm['coherent_change_mae']:.4f} vs identity "
+                  f"{cm['identity_coherent_change_mae']:.4f} "
+                  f"(Δ={cm['coherent_change_improvement']:+.4f})")
         else:
             print(f"Epoch {epoch:4d}/{args.epochs}  lr={lr:.2e}  "
                   f"train={tr_loss:.4f}{adv_str}  val={val_loss:.4f}")
@@ -563,6 +582,13 @@ def main():
             log["change/identity_mae"]  = cm["identity_change_mae"]
             log["change/mae_improvement"] = cm["change_mae_improvement"]
             log["change/roi_frac"]      = cm["change_roi_frac"]
+            # Noise-aware panel: the recoverable fraction of the ROI, the
+            # mis-registration signature, and skill on the coherent edit.
+            log["change/coherent_frac"]        = cm["coherent_frac"]
+            log["change/roi_edge_enrichment"]  = cm["roi_edge_enrichment"]
+            log["change/coherent_mae"]         = cm["coherent_change_mae"]
+            log["change/coherent_identity_mae"] = cm["identity_coherent_change_mae"]
+            log["change/coherent_mae_improvement"] = cm["coherent_change_improvement"]
         wandb_log(run, log, step=epoch)
 
         ckpt = checkpoint()

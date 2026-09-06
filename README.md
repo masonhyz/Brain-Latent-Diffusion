@@ -9,7 +9,7 @@ The current focus is **Flow3D**, a conditional flow matching model. A family of
 **3D diffusion models** precedes it, and older UNet / CVAE / CycleGAN baselines are
 retained as [legacy models](#legacy-models).
 
-## ⚠️ Two things to know before reading any number in this repo
+## ⚠️ Three things to know before reading any number in this repo
 
 ### 1. The metrics are not brain-masked, and the mask is the wrong one
 
@@ -67,6 +67,50 @@ binding constraint. The generative process is.
 This is what [Flow3D](#flow3d--conditional-flow-matching) is designed to fix, and
 why `moyamoya/metrics.py::identity_baseline` is computed and printed by every
 Flow3D training and evaluation run.
+
+### 3. Most of the pre→post "change" is registration noise, not surgery
+
+This is the one that most threatens the paper's central claim, and the one the
+first two warnings can hide behind. Identity wins because the volumes are nearly
+identical — so the only place a model can add value is the small **region of
+change** (`moyamoya/metrics.py::change_mask`, the top-5 % most-changed voxels). It
+is tempting to headline "we cut error by X% in the region surgery altered." But
+pre- and post-op are **separate acquisitions ~6 months apart, warped to a common
+space**, and measured across all 235 pairs that change region is mostly *noise*,
+not biology:
+
+- **~60 % of the change energy in the ROI is high-frequency** (σ=2 residual); only
+  ~40 % is coherent, low-frequency structure. `change_region_report` now reports
+  this as `coherent_frac`.
+- **The ROI is 2.2× enriched on `x_pre`'s structural edges** (0.448 vs 0.20 by
+  chance) — the classic **mis-registration signature**: a sub-voxel warp error at a
+  moving anatomical edge produces a large `|Δ|` that has nothing to do with
+  perfusion. Reported as `roi_edge_enrichment`.
+- The ROI change is **50/50 in sign** and only weakly lateralised (0.54), *not* the
+  coherent one-sided "revascularisation raises CBF" effect one would hope to model.
+- A population mean-change template explains individuals at **R² ≈ 0.02** — there is
+  no reusable fixed answer; localisation must be inferred per subject.
+- An **oracle smooth edit** (`x_pre` + Gaussian-blurred true Δ) removes ~62 % of the
+  ROI error — i.e. the *recoverable* signal is the low-frequency part.
+
+**What this means for the paper.** Do not report raw `change_mae` /
+`change_mae_improvement` as "predicting the surgical effect": a large part of that
+ROI error is registration/acquisition noise that no model can or should predict, so
+both the model's error and the identity bar are inflated by noise, and chasing it is
+exactly what produced the blurry and hallucinated results in the change-aware and
+adversarial experiments. Report instead the **noise-aware** numbers
+`change_region_report` now returns:
+
+- `coherent_frac` — the fraction of the ROI that is recoverable signal (the rest is
+  the **registration noise floor**); state it explicitly.
+- `coherent_change_mae` / `coherent_change_improvement` — error and skill on the
+  **coherent (low-frequency) edit** only, the part that is actually predictable.
+- `roi_edge_enrichment` — the mis-registration signature, as a caveat.
+
+Frame the contribution as predicting the **coherent** post-op change, and name
+mis-registration as a limitation: **improving pre/post co-registration would likely
+raise the ceiling more than any change to the loss** — a data-side fix this repo has
+flagged but not yet run.
 
 ## Data
 
