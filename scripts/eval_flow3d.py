@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from moyamoya.data import reconstruct_val_split
 from moyamoya.dataset import PrePostFMRI
-from moyamoya.metrics import compute_metrics, union_mask
+from moyamoya.metrics import change_region_report, compute_metrics, union_mask
 from moyamoya.models.flow3d import load_flow3d_checkpoint
 from moyamoya.runlog import save_grid
 from moyamoya.transform import ToChannelsFirstAndNormalize
@@ -46,6 +46,11 @@ from moyamoya.viz import percentile_norm as _to_np
 
 METRICS = ("mae", "mse", "psnr", "ssim")
 HIGHER_BETTER = {"mae": False, "mse": False, "psnr": True, "ssim": True}
+# Change-region + noise-aware keys reported alongside the whole-volume metrics.
+CHANGE_KEYS = ("change_mae", "identity_change_mae", "change_mae_improvement",
+               "change_psnr", "change_ssim", "change_roi_frac",
+               "coherent_frac", "roi_edge_enrichment", "coherent_change_mae",
+               "identity_coherent_change_mae", "coherent_change_improvement")
 
 
 def subject_seed(base: int, sid: str) -> int:
@@ -113,6 +118,8 @@ def main():
                    help="Restrict to the checkpoint's held-out validation split")
     p.add_argument("--val_frac",  type=float, default=None,
                    help="Override the split fraction recorded in the checkpoint")
+    p.add_argument("--change_roi_frac", type=float, default=0.05,
+                   help="Fraction of most-changed brain voxels defining the change ROI")
     p.add_argument("--seed",      type=int, default=None,
                    help="Override the split seed recorded in the checkpoint")
     # sampling
@@ -217,6 +224,7 @@ def main():
     rows = []
     model_acc = {m: [] for m in METRICS}
     ident_acc = {m: [] for m in METRICS}
+    change_acc = {k: [] for k in CHANGE_KEYS}
 
     for n, i in enumerate(indices, 1):
         x, y, meta = ds[i]
@@ -233,12 +241,19 @@ def main():
         # subject — so per-subject wins and losses are both visible, not just
         # the aggregate.
         bm = compute_metrics(x, y, mask)
+        # Change region: where surgery actually altered the scan. The raw ROI is
+        # ~60% registration/acq noise, so the coherent_* keys are the honest,
+        # noise-aware view (see metrics.change_region_report / README §3).
+        cm = change_region_report(pred_c, x, y, frac=args.change_roi_frac)
 
         for m in METRICS:
             model_acc[m].append(mm[m])
             ident_acc[m].append(bm[m])
+        for k in CHANGE_KEYS:
+            change_acc[k].append(cm[k])
         rows.append({"id": sid, **{m: mm[m] for m in METRICS},
-                     **{f"identity_{m}": bm[m] for m in METRICS}})
+                     **{f"identity_{m}": bm[m] for m in METRICS},
+                     **{k: cm[k] for k in CHANGE_KEYS}})
 
         if args.save_grids:
             save_grid(_to_np(xb), _to_np(y.unsqueeze(0)), _to_np(pred),
@@ -281,6 +296,24 @@ def main():
     print(f"\nPer-subject MAE wins over identity: {wins}/{len(rows)} "
           f"({100 * wins / len(rows):.0f}%)")
 
+    # ── change-region verdict (the number whole-volume metrics can't show) ────
+    # nanmean: subjects with an empty ROI (no change) contribute NaN, skip them.
+    ch = {k: (float(np.nanmean(change_acc[k])) if len(change_acc[k]) else float("nan"))
+          for k in CHANGE_KEYS}
+    print(f"\n=== change region (top {args.change_roi_frac:.0%} most-changed voxels) "
+          f"— n={len(indices)} ===")
+    print(f"  RAW ROI:       model MAE {ch['change_mae']:.4f}  vs identity "
+          f"{ch['identity_change_mae']:.4f}  (Δ={ch['change_mae_improvement']:+.4f}, "
+          f"{'BEATS' if ch['change_mae_improvement'] > 0 else 'loses to'} identity)")
+    print(f"    …but only {ch['coherent_frac']:.0%} of that ROI is recoverable "
+          f"signal; edges {ch['roi_edge_enrichment']:.1f}× enriched "
+          f"(mis-registration). The rest is the noise floor.")
+    print(f"  COHERENT edit: model MAE {ch['coherent_change_mae']:.4f}  vs identity "
+          f"{ch['identity_coherent_change_mae']:.4f}  "
+          f"(Δ={ch['coherent_change_improvement']:+.4f}, "
+          f"{'BEATS' if ch['coherent_change_improvement'] > 0 else 'loses to'} "
+          f"identity)  ← the honest number for the paper")
+
     summary = {
         "timestamp": datetime.now().isoformat(),
         "ckpt": args.ckpt, "use_ema": args.use_ema, "scope": scope,
@@ -295,6 +328,7 @@ def main():
         "identity": {m: aggregate(ident_acc[m]) for m in METRICS},
         "beats_identity": verdict,
         "per_subject_mae_wins": {"wins": wins, "total": len(rows)},
+        "change_region": {"roi_frac": args.change_roi_frac, **ch},
     }
     with open(out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
