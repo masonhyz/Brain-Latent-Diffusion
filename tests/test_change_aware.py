@@ -162,8 +162,28 @@ def test_coherent_change_split_separates_low_and_high_freq():
           f"noise {frac_high:.2f} coherent")
 
 
+def test_change_region_report_coherent_is_opt_in():
+    """coherent=False (default) returns ONLY the raw change_* keys; coherent=True
+    adds the coherent family. This is the revert: the honest metrics are opt-in."""
+    x_pre, sl = _volume(seed=9)
+    x_post = x_pre.clone()
+    x_post[(0, *sl)] += 1.5
+
+    base = change_region_report(x_pre, x_pre, x_post)                  # default
+    coh_keys = ("coherent_mae", "coherent_mse", "coherent_psnr", "coherent_ssim",
+                "identity_coherent_mae", "coherent_mae_improvement",
+                "coherent_frac", "edge_enrichment")
+    assert not any(k in base for k in coh_keys), "default must NOT emit coherent keys"
+    assert "change_mae" in base and "change_mae_improvement" in base
+
+    coh = change_region_report(x_pre, x_pre, x_post, coherent=True)    # opt-in
+    for k in coh_keys:
+        assert k in coh, f"coherent=True missing key {k}"
+    print("  ok  change_region_report: coherent family is opt-in (default = raw only)")
+
+
 def test_change_region_report_coherent_metrics():
-    """The noise-aware keys behave: identity recovers 0 coherent edit, a perfect
+    """The coherent family behaves: identity recovers 0 coherent edit, a perfect
     prediction recovers all of it, and coherent_frac lands strictly in (0, 1)
     when the target mixes a smooth edit with high-frequency noise."""
     shape = (24, 24, 24)
@@ -178,21 +198,18 @@ def test_change_region_report_coherent_metrics():
     hf_noise = 0.6 * rng.standard_normal(shape).astype(np.float32)  # registration-like noise
     x_post[sl] += (smooth_edit + hf_noise)[sl]
 
-    ident = change_region_report(x_pre, x_pre, x_post)       # pred = copy x_pre
-    for k in ("coherent_frac", "roi_edge_enrichment", "coherent_change_mae",
-              "identity_coherent_change_mae", "coherent_change_improvement"):
-        assert k in ident, f"missing key {k}"
+    ident = change_region_report(x_pre, x_pre, x_post, coherent=True)   # pred = copy x_pre
     # A genuinely mixed ROI: neither pure signal nor pure noise.
     assert 0.1 < ident["coherent_frac"] < 0.99, ident["coherent_frac"]
-    assert np.isfinite(ident["roi_edge_enrichment"])
-    assert abs(ident["coherent_change_improvement"]) < 1e-6, "identity recovers no coherent edit"
+    assert np.isfinite(ident["edge_enrichment"])
+    assert abs(ident["coherent_mae_improvement"]) < 1e-6, "identity recovers no coherent edit"
 
-    perfect = change_region_report(x_post, x_pre, x_post)    # pred = x_post
-    assert perfect["coherent_change_mae"] < 1e-6, perfect["coherent_change_mae"]
-    assert perfect["coherent_change_improvement"] > 0.0, perfect["coherent_change_improvement"]
+    perfect = change_region_report(x_post, x_pre, x_post, coherent=True)  # pred = x_post
+    assert perfect["coherent_mae"] < 1e-6, perfect["coherent_mae"]
+    assert perfect["coherent_mae_improvement"] > 0.0, perfect["coherent_mae_improvement"]
     print(f"  ok  change_region_report coherent view: frac={ident['coherent_frac']:.2f}, "
-          f"identity Δ_coh={ident['identity_coherent_change_mae']:.3f}, "
-          f"perfect improvement={perfect['coherent_change_improvement']:.3f}")
+          f"identity Δ_coh={ident['identity_coherent_mae']:.3f}, "
+          f"perfect improvement={perfect['coherent_mae_improvement']:.3f}")
 
 
 # ── change-emphasis sampler ──────────────────────────────────────────────────

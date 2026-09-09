@@ -46,11 +46,13 @@ from moyamoya.viz import percentile_norm as _to_np
 
 METRICS = ("mae", "mse", "psnr", "ssim")
 HIGHER_BETTER = {"mae": False, "mse": False, "psnr": True, "ssim": True}
-# Change-region + noise-aware keys reported alongside the whole-volume metrics.
+# Raw change-ROI keys, and the opt-in coherent (noise-stripped) family. Both are
+# reported only under --coherent; the default is whole-volume metrics alone.
 CHANGE_KEYS = ("change_mae", "identity_change_mae", "change_mae_improvement",
-               "change_psnr", "change_ssim", "change_roi_frac",
-               "coherent_frac", "roi_edge_enrichment", "coherent_change_mae",
-               "identity_coherent_change_mae", "coherent_change_improvement")
+               "change_psnr", "change_ssim", "change_roi_frac")
+COHERENT_KEYS = ("coherent_mae", "coherent_mse", "coherent_psnr", "coherent_ssim",
+                 "identity_coherent_mae", "coherent_mae_improvement",
+                 "coherent_frac", "edge_enrichment")
 
 
 def subject_seed(base: int, sid: str) -> int:
@@ -120,6 +122,11 @@ def main():
                    help="Override the split fraction recorded in the checkpoint")
     p.add_argument("--change_roi_frac", type=float, default=0.05,
                    help="Fraction of most-changed brain voxels defining the change ROI")
+    p.add_argument("--coherent", action="store_true",
+                   help="Also report change-region metrics: the raw ROI plus the "
+                        "coherent (registration-noise-stripped) family "
+                        "coherent_{mae,mse,psnr,ssim} + coherent_frac + "
+                        "edge_enrichment. Off by default (whole-volume metrics only).")
     p.add_argument("--seed",      type=int, default=None,
                    help="Override the split seed recorded in the checkpoint")
     # sampling
@@ -224,7 +231,8 @@ def main():
     rows = []
     model_acc = {m: [] for m in METRICS}
     ident_acc = {m: [] for m in METRICS}
-    change_acc = {k: [] for k in CHANGE_KEYS}
+    change_keys = CHANGE_KEYS + (COHERENT_KEYS if args.coherent else ())
+    change_acc = {k: [] for k in change_keys}
 
     for n, i in enumerate(indices, 1):
         x, y, meta = ds[i]
@@ -241,19 +249,22 @@ def main():
         # subject — so per-subject wins and losses are both visible, not just
         # the aggregate.
         bm = compute_metrics(x, y, mask)
-        # Change region: where surgery actually altered the scan. The raw ROI is
-        # ~60% registration/acq noise, so the coherent_* keys are the honest,
-        # noise-aware view (see metrics.change_region_report / README §3).
-        cm = change_region_report(pred_c, x, y, frac=args.change_roi_frac)
 
         for m in METRICS:
             model_acc[m].append(mm[m])
             ident_acc[m].append(bm[m])
-        for k in CHANGE_KEYS:
-            change_acc[k].append(cm[k])
-        rows.append({"id": sid, **{m: mm[m] for m in METRICS},
-                     **{f"identity_{m}": bm[m] for m in METRICS},
-                     **{k: cm[k] for k in CHANGE_KEYS}})
+        row = {"id": sid, **{m: mm[m] for m in METRICS},
+               **{f"identity_{m}": bm[m] for m in METRICS}}
+        if args.coherent:
+            # Change region: raw ROI + the coherent (noise-stripped) family. The
+            # raw ROI is ~60% registration/acq noise, so the coherent_* keys are
+            # the honest view (see metrics.change_region_report / README §3).
+            cm = change_region_report(pred_c, x, y, frac=args.change_roi_frac,
+                                      coherent=True)
+            for k in change_keys:
+                change_acc[k].append(cm[k])
+            row.update({k: cm[k] for k in change_keys})
+        rows.append(row)
 
         if args.save_grids:
             save_grid(_to_np(xb), _to_np(y.unsqueeze(0)), _to_np(pred),
@@ -296,23 +307,25 @@ def main():
     print(f"\nPer-subject MAE wins over identity: {wins}/{len(rows)} "
           f"({100 * wins / len(rows):.0f}%)")
 
-    # ── change-region verdict (the number whole-volume metrics can't show) ────
-    # nanmean: subjects with an empty ROI (no change) contribute NaN, skip them.
-    ch = {k: (float(np.nanmean(change_acc[k])) if len(change_acc[k]) else float("nan"))
-          for k in CHANGE_KEYS}
-    print(f"\n=== change region (top {args.change_roi_frac:.0%} most-changed voxels) "
-          f"— n={len(indices)} ===")
-    print(f"  RAW ROI:       model MAE {ch['change_mae']:.4f}  vs identity "
-          f"{ch['identity_change_mae']:.4f}  (Δ={ch['change_mae_improvement']:+.4f}, "
-          f"{'BEATS' if ch['change_mae_improvement'] > 0 else 'loses to'} identity)")
-    print(f"    …but only {ch['coherent_frac']:.0%} of that ROI is recoverable "
-          f"signal; edges {ch['roi_edge_enrichment']:.1f}× enriched "
-          f"(mis-registration). The rest is the noise floor.")
-    print(f"  COHERENT edit: model MAE {ch['coherent_change_mae']:.4f}  vs identity "
-          f"{ch['identity_coherent_change_mae']:.4f}  "
-          f"(Δ={ch['coherent_change_improvement']:+.4f}, "
-          f"{'BEATS' if ch['coherent_change_improvement'] > 0 else 'loses to'} "
-          f"identity)  ← the honest number for the paper")
+    # ── change-region verdict (only with --coherent) ─────────────────────────
+    ch = {}
+    if args.coherent:
+        # nanmean: subjects with an empty ROI (no change) contribute NaN, skip them.
+        ch = {k: (float(np.nanmean(change_acc[k])) if len(change_acc[k]) else float("nan"))
+              for k in change_keys}
+        print(f"\n=== change region (top {args.change_roi_frac:.0%} most-changed voxels) "
+              f"— n={len(indices)} ===")
+        print(f"  RAW ROI:   model MAE {ch['change_mae']:.4f}  vs identity "
+              f"{ch['identity_change_mae']:.4f}  (Δ={ch['change_mae_improvement']:+.4f}, "
+              f"{'BEATS' if ch['change_mae_improvement'] > 0 else 'loses to'} identity)")
+        print(f"    …but only {ch['coherent_frac']:.0%} of that ROI is recoverable "
+              f"signal; edges {ch['edge_enrichment']:.1f}× enriched "
+              f"(mis-registration). The rest is the noise floor.")
+        print(f"  COHERENT:  model MAE {ch['coherent_mae']:.4f}  vs identity "
+              f"{ch['identity_coherent_mae']:.4f}  "
+              f"(Δ={ch['coherent_mae_improvement']:+.4f}, "
+              f"{'BEATS' if ch['coherent_mae_improvement'] > 0 else 'loses to'} "
+              f"identity)  ← the honest number for the paper")
 
     summary = {
         "timestamp": datetime.now().isoformat(),
@@ -328,7 +341,8 @@ def main():
         "identity": {m: aggregate(ident_acc[m]) for m in METRICS},
         "beats_identity": verdict,
         "per_subject_mae_wins": {"wins": wins, "total": len(rows)},
-        "change_region": {"roi_frac": args.change_roi_frac, **ch},
+        **({"change_region": {"roi_frac": args.change_roi_frac, **ch}}
+           if args.coherent else {}),
     }
     with open(out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)

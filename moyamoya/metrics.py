@@ -206,7 +206,7 @@ def edge_enrichment(x_pre, roi, brain=None, edge_frac: float = 0.20) -> float:
 
 
 def change_region_report(pred, x_pre, x_post, frac: float = 0.05,
-                         data_range: float | None = None,
+                         data_range: float | None = None, coherent: bool = False,
                          sigma: float = 2.0, edge_frac: float = 0.20) -> dict:
     """Score ``pred`` against ``x_post`` **inside the region of change**, next to
     what the identity baseline (copy x_pre) scores in the same ROI.
@@ -218,47 +218,40 @@ def change_region_report(pred, x_pre, x_post, frac: float = 0.05,
     genuinely reduced error where the surgery actually changed the scan. The ROI
     is :func:`change_mask` (top ``frac`` most-changed brain voxels).
 
-    **Beware the change ROI is ~60 % registration/acquisition noise**, so the raw
-    ``change_mae`` above scores the model partly against noise it should not try to
-    predict (see :func:`coherent_change_split`). The report therefore also returns
-    the honest, noise-aware view:
+    **The change ROI is ~60 % registration/acquisition noise**, so ``change_mae``
+    scores the model partly against noise it should not try to predict (see
+    :func:`coherent_change_split`). Pass ``coherent=True`` to *also* get the honest,
+    noise-aware **coherent** family — the same four metrics computed on the
+    registration-noise-stripped (σ=``sigma`` low-pass) change, plus two diagnostics:
 
+    * ``coherent_mae`` / ``coherent_mse`` / ``coherent_psnr`` / ``coherent_ssim`` —
+      model error on the coherent change *image* ``x_pre + gaussian(pred − x_pre)``
+      against the coherent target ``x_pre + gaussian(x_post − x_pre)`` in the ROI.
+      Smoothing both sides means correct high-freq content is neither rewarded nor
+      punished (identity → 0 improvement, perfect → 0 error).
+    * ``identity_coherent_mae`` / ``coherent_mae_improvement`` — the identity bar on
+      the coherent change and the model's signed win over it. **The paper number.**
     * ``coherent_frac`` — fraction of the ROI change *energy* that is coherent
-      (σ=``sigma`` low-pass). ~0.4 here; ``1 − coherent_frac`` is the
-      registration/noise floor. This is the number that stops the paper from
-      reading a model's failure to reproduce noise as a modelling failure.
-    * ``roi_edge_enrichment`` — how much the ROI over-represents ``x_pre`` edges vs
+      (~0.4 here; ``1 − coherent_frac`` is the registration/noise floor).
+    * ``edge_enrichment`` — how much the ROI over-represents ``x_pre`` edges vs
       chance (:func:`edge_enrichment`); >1 is the mis-registration signature (~2.2×).
-    * ``coherent_change_mae`` / ``identity_coherent_change_mae`` /
-      ``coherent_change_improvement`` — error of the **coherent part of the
-      predicted edit** ``gaussian(pred − x_pre)`` against ``Δ_coh`` in the ROI, and
-      the identity baseline there. This is the "did the model recover the
-      *recoverable* edit?" number — the one worth putting in the paper.
+
+    ``coherent=False`` (the default) returns only the six ``change_*`` keys — the
+    original change-region report, unchanged.
     """
     roi = change_mask(x_pre, x_post, frac=frac)
-    keys = ("change_mae", "change_psnr", "change_ssim", "identity_change_mae",
-            "change_mae_improvement", "change_roi_frac", "coherent_frac",
-            "roi_edge_enrichment", "coherent_change_mae",
-            "identity_coherent_change_mae", "coherent_change_improvement")
+    base_keys = ("change_mae", "change_psnr", "change_ssim", "identity_change_mae",
+                 "change_mae_improvement", "change_roi_frac")
+    coh_keys = ("coherent_mae", "coherent_mse", "coherent_psnr", "coherent_ssim",
+                "identity_coherent_mae", "coherent_mae_improvement",
+                "coherent_frac", "edge_enrichment")
+    keys = base_keys + (coh_keys if coherent else ())
     if roi.sum() == 0:
         return {k: (0.0 if k == "change_roi_frac" else float("nan")) for k in keys}
+
     model = compute_metrics(pred,  x_post, roi, data_range=data_range)
     ident = compute_metrics(x_pre, x_post, roi, data_range=data_range)
-
-    # Coherent (recoverable) vs high-frequency (registration/noise) decomposition.
-    delta_coh, delta_hf = coherent_change_split(x_pre, x_post, sigma=sigma)
-    r = _as_np(roi).astype(bool)
-    e_tot = float((delta_coh[r] ** 2).sum() + (delta_hf[r] ** 2).sum())  # Σ Δ² over ROI
-    coherent_frac = float((delta_coh[r] ** 2).sum() / e_tot) if e_tot > 0 else float("nan")
-
-    # Coherent part of the *predicted edit*, so correct high-freq content in the
-    # prediction is not scored as error against a smoothed target.
-    edit_pred = _as_np(pred).astype(np.float32) - _as_np(x_pre).astype(np.float32)
-    coh_pred = gaussian_filter(edit_pred, sigma=sigma).astype(np.float32)
-    coherent_change_mae = float(np.abs(coh_pred[r] - delta_coh[r]).mean())
-    identity_coherent_change_mae = float(np.abs(delta_coh[r]).mean())  # coh_pred≡0 for x_pre
-
-    return {
+    out = {
         "change_mae":  model["mae"],
         "change_psnr": model["psnr"],
         "change_ssim": model["ssim"],
@@ -266,14 +259,35 @@ def change_region_report(pred, x_pre, x_post, frac: float = 0.05,
         # >0 ⇒ the model beats copy-x_pre where it actually matters.
         "change_mae_improvement": ident["mae"] - model["mae"],
         "change_roi_frac": float(roi.mean()),
-        # Noise-aware view — report THESE, not the raw change_mae, in the paper.
-        "coherent_frac": coherent_frac,
-        "roi_edge_enrichment": edge_enrichment(x_pre, roi, edge_frac=edge_frac),
-        "coherent_change_mae": coherent_change_mae,
-        "identity_coherent_change_mae": identity_coherent_change_mae,
-        # >0 ⇒ the model recovered coherent edit that copying x_pre did not.
-        "coherent_change_improvement": identity_coherent_change_mae - coherent_change_mae,
     }
+    if not coherent:
+        return out
+
+    # ── coherent (registration-noise-stripped) family ────────────────────────
+    r = _as_np(roi).astype(bool)
+    xp = _as_np(x_pre).astype(np.float32)
+    delta_coh, delta_hf = coherent_change_split(x_pre, x_post, sigma=sigma)
+    e_coh = float((delta_coh[r] ** 2).sum())
+    e_tot = e_coh + float((delta_hf[r] ** 2).sum())
+    # Coherent change *images* (x_pre + smoothed edit), so the family parallels the
+    # whole-volume metrics and the x_pre baseline is exact (gaussian(0)=0).
+    coh_tgt  = xp + delta_coh
+    coh_pred = xp + gaussian_filter(_as_np(pred).astype(np.float32) - xp,
+                                    sigma=sigma).astype(np.float32)
+    m  = compute_metrics(coh_pred, coh_tgt, roi, data_range=data_range)
+    bi = compute_metrics(xp,       coh_tgt, roi, data_range=data_range)  # identity
+    out.update({
+        "coherent_mae":  m["mae"],
+        "coherent_mse":  m["mse"],
+        "coherent_psnr": m["psnr"],
+        "coherent_ssim": m["ssim"],
+        "identity_coherent_mae": bi["mae"],
+        # >0 ⇒ the model recovered coherent edit that copying x_pre did not.
+        "coherent_mae_improvement": bi["mae"] - m["mae"],
+        "coherent_frac": (e_coh / e_tot) if e_tot > 0 else float("nan"),
+        "edge_enrichment": edge_enrichment(x_pre, roi, edge_frac=edge_frac),
+    })
+    return out
 
 
 def identity_baseline(pairs, mask_fn=tissue_mask, **kw) -> dict:

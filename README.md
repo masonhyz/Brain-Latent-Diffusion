@@ -80,12 +80,12 @@ space**, and measured across all 235 pairs that change region is mostly *noise*,
 not biology:
 
 - **~60 % of the change energy in the ROI is high-frequency** (σ=2 residual); only
-  ~40 % is coherent, low-frequency structure. `change_region_report` now reports
-  this as `coherent_frac`.
+  ~40 % is coherent, low-frequency structure. `change_region_report(coherent=True)`
+  reports this as `coherent_frac`.
 - **The ROI is 2.2× enriched on `x_pre`'s structural edges** (0.448 vs 0.20 by
   chance) — the classic **mis-registration signature**: a sub-voxel warp error at a
   moving anatomical edge produces a large `|Δ|` that has nothing to do with
-  perfusion. Reported as `roi_edge_enrichment`.
+  perfusion. Reported as `edge_enrichment`.
 - The ROI change is **50/50 in sign** and only weakly lateralised (0.54), *not* the
   coherent one-sided "revascularisation raises CBF" effect one would hope to model.
 - A population mean-change template explains individuals at **R² ≈ 0.02** — there is
@@ -98,14 +98,16 @@ not biology:
 ROI error is registration/acquisition noise that no model can or should predict, so
 both the model's error and the identity bar are inflated by noise, and chasing it is
 exactly what produced the blurry and hallucinated results in the change-aware and
-adversarial experiments. Report instead the **noise-aware** numbers
-`change_region_report` now returns:
+adversarial experiments. Report instead the **noise-aware** numbers from the opt-in
+**coherent** family (`change_region_report(coherent=True)`, or `--coherent` on the
+train/eval scripts; off by default so the standard metrics are unchanged):
 
 - `coherent_frac` — the fraction of the ROI that is recoverable signal (the rest is
   the **registration noise floor**); state it explicitly.
-- `coherent_change_mae` / `coherent_change_improvement` — error and skill on the
-  **coherent (low-frequency) edit** only, the part that is actually predictable.
-- `roi_edge_enrichment` — the mis-registration signature, as a caveat.
+- `coherent_mae` / `coherent_mae_improvement` (and `coherent_{mse,psnr,ssim}`) —
+  error and skill on the **coherent (low-frequency) edit** only, the part that is
+  actually predictable.
+- `edge_enrichment` — the mis-registration signature, as a caveat.
 
 Frame the contribution as predicting the **coherent** post-op change, and name
 mis-registration as a limitation: **improving pre/post co-registration would likely
