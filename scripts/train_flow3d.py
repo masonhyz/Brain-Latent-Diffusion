@@ -187,6 +187,13 @@ def get_args():
                         "change-region ROI reported at validation (change/* metrics). "
                         "This is where a model can actually beat identity; the "
                         "whole-volume metrics are blind to it.")
+    p.add_argument("--coherent", dest="coherent", action="store_true", default=True,
+                   help="Report the coherent (registration-noise-stripped) change "
+                        "metrics coherent_{mae,mse,psnr,ssim} + coherent_frac + "
+                        "edge_enrichment (default on). The raw change/* metrics are "
+                        "reported either way.")
+    p.add_argument("--no-coherent", dest="coherent", action="store_false",
+                   help="Report only the raw change/* metrics, not the coherent family.")
     # ── adversarial detail term (the anti-blur fix) ──────────────────────────
     p.add_argument("--adv_weight", type=float, default=0.0,
                    help="Weight of the adversarial (hinge PatchGAN) term on the "
@@ -305,8 +312,19 @@ def report_gpu(device) -> None:
               f"another device, or lower --dim / --init_kernel_size.")
 
 
+# Raw change-ROI keys, always reported. The coherent (registration-noise-stripped)
+# family is opt-in via --coherent; see metrics.change_region_report / README §3.
 CHANGE_KEYS = ("change_mae", "change_psnr", "change_ssim",
                "identity_change_mae", "change_mae_improvement", "change_roi_frac")
+COHERENT_KEYS = ("coherent_mae", "coherent_mse", "coherent_psnr", "coherent_ssim",
+                 "identity_coherent_mae", "coherent_mae_improvement",
+                 "coherent_frac", "edge_enrichment")
+
+
+def change_keys_for(args) -> tuple:
+    """The change-region keys reported for this run: raw ROI always, coherent
+    family only when ``--coherent`` is set."""
+    return CHANGE_KEYS + (COHERENT_KEYS if getattr(args, "coherent", False) else ())
 
 
 def save_gate_vis(x_pre_np, gate_np, target_np, title, path):
@@ -349,10 +367,11 @@ def evaluate(model, val_dl, device, args, steps: int):
     Whole-volume metrics are the union-mask numbers the 7TCDM3D/LDM models report
     (comparable, but ~71% background). Change-region metrics score only the ROI
     where surgery actually altered the scan (see metrics.change_region_report) —
-    the number that reveals whether the model learned the substantial edits.
+    the number that reveals whether the model learned the substantial edits. The
+    coherent (noise-stripped) family is added only under ``--coherent``.
     """
     acc = {"mae": [], "mse": [], "psnr": [], "ssim": []}
-    cacc = {k: [] for k in CHANGE_KEYS}
+    cacc = {k: [] for k in change_keys_for(args)}
     gated = getattr(model, "gated", False)
     gate_corr, gate_auc = [], []
     for x, y in val_dl:
@@ -368,7 +387,8 @@ def evaluate(model, val_dl, device, args, steps: int):
             m = compute_metrics(p, y[i], union_mask(x[i], y[i]))
             for k in acc:
                 acc[k].append(m[k])
-            cm = change_region_report(p, x[i], y[i], frac=args.change_roi_frac)
+            cm = change_region_report(p, x[i], y[i], frac=args.change_roi_frac,
+                                      coherent=args.coherent)
             for k in cacc:
                 cacc[k].append(cm[k])
             if gmap is not None:
@@ -582,8 +602,9 @@ def main():
                          ["epoch", "lr", "train_loss", "reg_loss", "det_loss",
                           "g_adv", "d_loss", "val_loss",
                           "mae", "mse", "psnr", "ssim",
-                          "change_mae", "identity_change_mae",
-                          "change_mae_improvement", "change_psnr", "change_ssim",
+                          *CHANGE_KEYS,
+                          # coherent columns only when --coherent is set
+                          *(COHERENT_KEYS if args.coherent else ()),
                           "gate_corr", "gate_auc"])
     vis_dir = out_dir / "vis"
     vis_dir.mkdir(exist_ok=True)
@@ -681,7 +702,8 @@ def main():
         # Sampled metrics use the EMA weights — that is what eval/inference load.
         m, cm = (evaluate(ema_model, val_dl, device, args, val_steps) if do_metrics
                  else ({k: float("nan") for k in METRIC_HIGHER_BETTER},
-                       {k: float("nan") for k in (*CHANGE_KEYS, "gate_corr", "gate_auc")}))
+                       {k: float("nan")
+                        for k in (*change_keys_for(args), "gate_corr", "gate_auc")}))
 
         if do_metrics:
             flags = "".join(
@@ -702,6 +724,16 @@ def main():
                   f"(Δ={cm['change_mae_improvement']:+.4f}, "
                   f"{'BEATS' if cm['change_mae_improvement'] > 0 else 'loses to'} identity)  "
                   f"PSNR={cm['change_psnr']:.2f}  SSIM={cm['change_ssim']:.4f}{gate_str}")
+            if args.coherent:
+                # Honest, noise-aware line: only ~coherent_frac of that ROI is
+                # recoverable signal (the rest is registration/acq noise, edge-
+                # enriched ~edge_enrichment×); coherent-Δ is skill on the part
+                # that is actually predictable. Report THIS in the paper.
+                print(f"              └ coherent {cm['coherent_frac']:.2f} of ROI "
+                      f"(edge-enrich {cm['edge_enrichment']:.1f}×); coherent-MAE "
+                      f"{cm['coherent_mae']:.4f} vs identity "
+                      f"{cm['identity_coherent_mae']:.4f} "
+                      f"(Δ={cm['coherent_mae_improvement']:+.4f})")
         else:
             print(f"Epoch {epoch:4d}/{args.epochs}  lr={lr:.2e}  "
                   f"train={tr_loss:.4f}{det_str}{adv_str}  val={val_loss:.4f}")
@@ -742,6 +774,14 @@ def main():
             if args.gated and np.isfinite(cm.get("gate_auc", float("nan"))):
                 log["gate/auc"]  = cm["gate_auc"]
                 log["gate/corr"] = cm["gate_corr"]
+            if args.coherent:
+                # Noise-aware panel: the recoverable fraction of the ROI, the
+                # mis-registration signature, and skill on the coherent edit.
+                log["change/coherent_frac"]        = cm["coherent_frac"]
+                log["change/edge_enrichment"]      = cm["edge_enrichment"]
+                log["change/coherent_mae"]         = cm["coherent_mae"]
+                log["change/coherent_identity_mae"] = cm["identity_coherent_mae"]
+                log["change/coherent_mae_improvement"] = cm["coherent_mae_improvement"]
         wandb_log(run, log, step=epoch)
 
         ckpt = checkpoint()

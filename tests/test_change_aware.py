@@ -22,12 +22,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.ndimage import gaussian_filter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from moyamoya.models.flow3d import change_weight_map
 from moyamoya.metrics import (
-    change_mask, change_region_report, foreground_mask,
+    change_mask, change_region_report, coherent_change_split, foreground_mask,
 )
 from moyamoya.data import change_magnitudes, change_sampler
 
@@ -137,6 +138,79 @@ def test_change_region_report_identity_vs_perfect():
     assert perfect["change_mae_improvement"] > 1.0, perfect["change_mae_improvement"]
     assert perfect["change_roi_frac"] > 0
     print("  ok  change_region_report: copy→0 improvement, perfect→large improvement")
+
+
+# ── coherent vs registration-noise decomposition ─────────────────────────────
+
+def test_coherent_change_split_separates_low_and_high_freq():
+    """A smooth (low-frequency) edit is almost all coherent energy; a per-voxel
+    (high-frequency) edit — the registration/noise signature — is almost none."""
+    shape = (24, 24, 24)
+    rng = np.random.default_rng(0)
+    x_pre = np.zeros(shape, np.float32)
+
+    low = gaussian_filter(rng.standard_normal(shape).astype(np.float32), 4.0)
+    coh, hf = coherent_change_split(x_pre, x_pre + low, sigma=2.0)
+    frac_low = (coh ** 2).sum() / ((coh ** 2).sum() + (hf ** 2).sum())
+    assert frac_low > 0.9, f"low-freq edit should be ~all coherent, got {frac_low:.3f}"
+
+    high = rng.standard_normal(shape).astype(np.float32)
+    coh2, hf2 = coherent_change_split(x_pre, x_pre + high, sigma=2.0)
+    frac_high = (coh2 ** 2).sum() / ((coh2 ** 2).sum() + (hf2 ** 2).sum())
+    assert frac_high < 0.1, f"white-noise edit should be ~no coherent, got {frac_high:.3f}"
+    print(f"  ok  coherent_change_split: low-freq {frac_low:.2f} coherent, "
+          f"noise {frac_high:.2f} coherent")
+
+
+def test_change_region_report_reports_both_by_default():
+    """Default (coherent=True) reports BOTH the raw change_* keys and the coherent
+    family; coherent=False is the lean mode that drops the coherent family."""
+    x_pre, sl = _volume(seed=9)
+    x_post = x_pre.clone()
+    x_post[(0, *sl)] += 1.5
+
+    coh_keys = ("coherent_mae", "coherent_mse", "coherent_psnr", "coherent_ssim",
+                "identity_coherent_mae", "coherent_mae_improvement",
+                "coherent_frac", "edge_enrichment")
+    both = change_region_report(x_pre, x_pre, x_post)                  # default
+    assert "change_mae" in both and "change_mae_improvement" in both, "raw keys missing"
+    for k in coh_keys:
+        assert k in both, f"default must emit coherent key {k}"
+
+    lean = change_region_report(x_pre, x_pre, x_post, coherent=False)  # lean
+    assert "change_mae" in lean
+    assert not any(k in lean for k in coh_keys), "coherent=False must drop coherent keys"
+    print("  ok  change_region_report: both families by default; coherent=False is lean")
+
+
+def test_change_region_report_coherent_metrics():
+    """The coherent family behaves: identity recovers 0 coherent edit, a perfect
+    prediction recovers all of it, and coherent_frac lands strictly in (0, 1)
+    when the target mixes a smooth edit with high-frequency noise."""
+    shape = (24, 24, 24)
+    rng = np.random.default_rng(1)
+    x_pre = np.zeros(shape, np.float32)
+    sl = tuple(slice(2, 22) for _ in shape)                 # 20³ brain block
+    x_pre[sl] = 1.0 + rng.random((20, 20, 20)).astype(np.float32)
+
+    x_post = x_pre.copy()
+    low = gaussian_filter(rng.standard_normal(shape).astype(np.float32), 3.0)
+    smooth_edit = 1.5 * (low / low.std())                   # coherent part, std≈1.5
+    hf_noise = 0.6 * rng.standard_normal(shape).astype(np.float32)  # registration-like noise
+    x_post[sl] += (smooth_edit + hf_noise)[sl]
+
+    ident = change_region_report(x_pre, x_pre, x_post, coherent=True)   # pred = copy x_pre
+    # A genuinely mixed ROI: neither pure signal nor pure noise.
+    assert 0.1 < ident["coherent_frac"] < 0.99, ident["coherent_frac"]
+    assert np.isfinite(ident["edge_enrichment"])
+    assert abs(ident["coherent_mae_improvement"]) < 1e-6, "identity recovers no coherent edit"
+
+    perfect = change_region_report(x_post, x_pre, x_post, coherent=True)  # pred = x_post
+    assert perfect["coherent_mae"] < 1e-6, perfect["coherent_mae"]
+    assert perfect["coherent_mae_improvement"] > 0.0, perfect["coherent_mae_improvement"]
+    print(f"  ok  change_region_report coherent view: frac={ident['coherent_frac']:.2f}, "
+          f"identity Δ_coh={ident['identity_coherent_mae']:.3f}, "
+          f"perfect improvement={perfect['coherent_mae_improvement']:.3f}")
 
 
 # ── change-emphasis sampler ──────────────────────────────────────────────────
