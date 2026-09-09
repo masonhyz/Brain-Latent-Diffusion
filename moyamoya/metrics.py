@@ -206,7 +206,7 @@ def edge_enrichment(x_pre, roi, brain=None, edge_frac: float = 0.20) -> float:
 
 
 def change_region_report(pred, x_pre, x_post, frac: float = 0.05,
-                         data_range: float | None = None, coherent: bool = False,
+                         data_range: float | None = None, coherent: bool = True,
                          sigma: float = 2.0, edge_frac: float = 0.20) -> dict:
     """Score ``pred`` against ``x_post`` **inside the region of change**, next to
     what the identity baseline (copy x_pre) scores in the same ROI.
@@ -236,8 +236,8 @@ def change_region_report(pred, x_pre, x_post, frac: float = 0.05,
     * ``edge_enrichment`` — how much the ROI over-represents ``x_pre`` edges vs
       chance (:func:`edge_enrichment`); >1 is the mis-registration signature (~2.2×).
 
-    ``coherent=False`` (the default) returns only the six ``change_*`` keys — the
-    original change-region report, unchanged.
+    ``coherent=True`` (the default) reports both families. Pass ``coherent=False``
+    for a lean report of only the six raw ``change_*`` keys.
     """
     roi = change_mask(x_pre, x_post, frac=frac)
     base_keys = ("change_mae", "change_psnr", "change_ssim", "identity_change_mae",

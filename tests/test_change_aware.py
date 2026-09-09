@@ -162,24 +162,25 @@ def test_coherent_change_split_separates_low_and_high_freq():
           f"noise {frac_high:.2f} coherent")
 
 
-def test_change_region_report_coherent_is_opt_in():
-    """coherent=False (default) returns ONLY the raw change_* keys; coherent=True
-    adds the coherent family. This is the revert: the honest metrics are opt-in."""
+def test_change_region_report_reports_both_by_default():
+    """Default (coherent=True) reports BOTH the raw change_* keys and the coherent
+    family; coherent=False is the lean mode that drops the coherent family."""
     x_pre, sl = _volume(seed=9)
     x_post = x_pre.clone()
     x_post[(0, *sl)] += 1.5
 
-    base = change_region_report(x_pre, x_pre, x_post)                  # default
     coh_keys = ("coherent_mae", "coherent_mse", "coherent_psnr", "coherent_ssim",
                 "identity_coherent_mae", "coherent_mae_improvement",
                 "coherent_frac", "edge_enrichment")
-    assert not any(k in base for k in coh_keys), "default must NOT emit coherent keys"
-    assert "change_mae" in base and "change_mae_improvement" in base
-
-    coh = change_region_report(x_pre, x_pre, x_post, coherent=True)    # opt-in
+    both = change_region_report(x_pre, x_pre, x_post)                  # default
+    assert "change_mae" in both and "change_mae_improvement" in both, "raw keys missing"
     for k in coh_keys:
-        assert k in coh, f"coherent=True missing key {k}"
-    print("  ok  change_region_report: coherent family is opt-in (default = raw only)")
+        assert k in both, f"default must emit coherent key {k}"
+
+    lean = change_region_report(x_pre, x_pre, x_post, coherent=False)  # lean
+    assert "change_mae" in lean
+    assert not any(k in lean for k in coh_keys), "coherent=False must drop coherent keys"
+    print("  ok  change_region_report: both families by default; coherent=False is lean")
 
 
 def test_change_region_report_coherent_metrics():

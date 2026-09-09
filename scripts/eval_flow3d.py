@@ -122,11 +122,12 @@ def main():
                    help="Override the split fraction recorded in the checkpoint")
     p.add_argument("--change_roi_frac", type=float, default=0.05,
                    help="Fraction of most-changed brain voxels defining the change ROI")
-    p.add_argument("--coherent", action="store_true",
-                   help="Also report change-region metrics: the raw ROI plus the "
-                        "coherent (registration-noise-stripped) family "
-                        "coherent_{mae,mse,psnr,ssim} + coherent_frac + "
-                        "edge_enrichment. Off by default (whole-volume metrics only).")
+    p.add_argument("--coherent", dest="coherent", action="store_true", default=True,
+                   help="Report the change-region block (default on): the raw ROI "
+                        "plus the coherent (registration-noise-stripped) family "
+                        "coherent_{mae,mse,psnr,ssim} + coherent_frac + edge_enrichment.")
+    p.add_argument("--no-coherent", dest="coherent", action="store_false",
+                   help="Lean mode: whole-volume metrics only (no change region).")
     p.add_argument("--seed",      type=int, default=None,
                    help="Override the split seed recorded in the checkpoint")
     # sampling

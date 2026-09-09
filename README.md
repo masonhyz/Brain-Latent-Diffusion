@@ -278,7 +278,39 @@ python scripts/eval_flow3d.py --ckpt runs/flow3d_bridge/best_mae.pt \
 `metrics.csv` carries both the model's and the identity baseline's per-subject
 scores, and `summary.json` records a `beats_identity` verdict plus the per-subject
 MAE win rate — an aggregate can hide a model that helps a few subjects and harms
-the rest.
+the rest. Every eval reports **both** the whole-volume metrics and the
+change-region block (raw ROI + the coherent, registration-noise-stripped family,
+see [§3](#3-most-of-the-pre→post-change-is-registration-noise-not-surgery)) by
+default; pass `--no-coherent` for the lean whole-volume-only report.
+
+### Comparing models — the eval harness
+
+`scripts/eval_harness.py` scores many models **the same way** and collects one tidy
+comparison table (whole-volume + change + coherent). Each model is evaluated on
+**its own recorded held-out split** (the seed/val_frac in its checkpoint — no model
+is scored on a subject it trained on); because those splits differ, the subject sets
+differ, so the harness prints each model's split and warns when they disagree. It
+delegates to `eval_flow3d.py` one subprocess per model (GPU freed between models).
+
+```bash
+# every flow3d run under a directory (best_mae.pt of each), ranked by coherent Δ
+GPU=0 python scripts/eval_harness.py --runs_dir runs --select best_mae
+
+# an explicit set, with names
+GPU=0 python scripts/eval_harness.py \
+    --ckpts runs/flow3d_bridge/best_mae.pt runs/flow3d_sharp/best_mae.pt \
+    --labels bridge sharp
+
+# see what would run, without running it
+python scripts/eval_harness.py --runs_dir runs --dry_run
+```
+
+Writes `comparison.csv` / `comparison.json` under `outputs/harness/<timestamp>/`.
+**Flow3D is wired; diffusion families (LDM / CDM3D / 7TCDM) are a documented hook**
+— `FAMILY_ADAPTERS` in the script — because their whole-volume preprocessing is not
+directly comparable to Flow3D's (see [§1](#1-the-metrics-are-not-brain-masked-and-the-mask-is-the-wrong-one)); wiring one means emitting the same `summary.json` schema.
+For a strict head-to-head in the paper, evaluate all models on a single global test
+set held out from every run, rather than each model's own split.
 
 ### Self-checks
 

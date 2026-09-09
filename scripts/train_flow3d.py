@@ -123,11 +123,13 @@ def get_args():
                         "change-region ROI reported at validation (change/* metrics). "
                         "This is where a model can actually beat identity; the "
                         "whole-volume metrics are blind to it.")
-    p.add_argument("--coherent", dest="coherent", action="store_true",
-                   help="Additionally report the coherent (registration-noise-"
-                        "stripped) change metrics coherent_{mae,mse,psnr,ssim} + "
-                        "coherent_frac + edge_enrichment. Off by default; the raw "
-                        "change/* metrics are reported either way.")
+    p.add_argument("--coherent", dest="coherent", action="store_true", default=True,
+                   help="Report the coherent (registration-noise-stripped) change "
+                        "metrics coherent_{mae,mse,psnr,ssim} + coherent_frac + "
+                        "edge_enrichment (default on). The raw change/* metrics are "
+                        "reported either way.")
+    p.add_argument("--no-coherent", dest="coherent", action="store_false",
+                   help="Report only the raw change/* metrics, not the coherent family.")
     # ── adversarial detail term (the anti-blur fix) ──────────────────────────
     p.add_argument("--adv_weight", type=float, default=0.0,
                    help="Weight of the adversarial (hinge PatchGAN) term on the "
